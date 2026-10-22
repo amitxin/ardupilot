@@ -7952,6 +7952,45 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.wait_altitude(10, 3000, relative=True)
         self.do_RTL()
 
+    def SplineNavDelay(self):
+        '''Test spline waypoint followed by NAV_DELAY with ignored time fields'''
+        # see https://github.com/ArduPilot/ardupilot/issues/34651 ;
+        # NAV_DELAY's hour/min/sec of -1 were read as an altitude
+        # for the spline's next control point
+        self.start_flying_simple_relhome_mission([
+            (mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 20),
+            (mavutil.mavlink.MAV_CMD_NAV_SPLINE_WAYPOINT, 30, 20, 25),
+            (mavutil.mavlink.MAV_CMD_NAV_SPLINE_WAYPOINT, 30, 60, 20),
+            (mavutil.mavlink.MAV_CMD_NAV_SPLINE_WAYPOINT, 0, 80, 15),
+            self.create_MISSION_ITEM_INT(
+                mavutil.mavlink.MAV_CMD_NAV_DELAY,
+                p1=3,
+                p2=-1,
+                p3=-1,
+                p4=-1,
+            ),
+            (mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH, 0, 0, 0),
+        ])
+
+        # the vehicle must not descend much below the lowest spline
+        # waypoint while flying the spline legs
+        self.wait_current_waypoint(2, timeout=60)
+        self.context_push()
+        min_alt = 12
+
+        def check_altitude(mav, m):
+            if m.get_type() != 'GLOBAL_POSITION_INT':
+                return
+            alt = m.relative_alt * 0.001
+            if alt < min_alt:
+                raise NotAchievedException(f"Spline descended to {alt:.1f}m (want >= {min_alt}m)")
+
+        self.install_message_hook_context(check_altitude)
+        self.wait_current_waypoint(5, timeout=120)
+        self.context_pop()
+
+        self.wait_disarmed(timeout=120)
+
     def ManualThrottleModeChange(self):
         '''Check manual throttle mode changes denied on high throttle'''
         self.set_parameter("FS_GCS_ENABLE", 0) # avoid GUIDED instant disarm
@@ -19596,6 +19635,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             self.HorizontalAvoidFence,
             self.ModeFlowHold,
             self.SplineLastWaypoint,
+            self.SplineNavDelay,
             self.ATTITUDE_FAST,
             self.PosHoldTakeOff,
             self.ParameterValidation,
@@ -22491,14 +22531,28 @@ RTL_ALT_M 111
 
         self.do_RTL(timeout=600)
 
-    def mission_NAV_LOITER_TURNS(self):
-        '''test that loiter turns basically works'''
+    def fly_mission_NAV_LOITER_TURNS(self, ccw=False, circle_centre_loc=None, radius_m=30):
+        '''fly a mission containing a single LOITER_TURNS item, checking the
+        circle is flown in the direction the mission item asks for.  A
+        negative loiter radius asks for a counter-clockwise circle.  If
+        circle_centre_loc is None then no location is supplied in the
+        mission item, so the vehicle circles where it is when the item
+        starts - which is over home'''
+        lat = 0
+        lng = 0
+        if circle_centre_loc is None:
+            circle_centre_loc = self.home_position_as_location()
+        else:
+            lat = int(circle_centre_loc.lat*1e7)
+            lng = int(circle_centre_loc.lng*1e7)
         self.upload_simple_relhome_mission([
             (mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 20),
             self.create_MISSION_ITEM_INT(
                 mavutil.mavlink.MAV_CMD_NAV_LOITER_TURNS,
                 p1=1,
-                p3=30,
+                p3=-radius_m if ccw else radius_m,
+                x=lat,
+                y=lng,
                 z=30,  # circle is 10m higher than takeoff
                 frame=mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
             ),
@@ -22508,33 +22562,28 @@ RTL_ALT_M 111
         self.set_parameter('AUTO_OPTIONS', 3)
         self.wait_ready_to_arm()
         self.arm_vehicle()
+        self.wait_current_waypoint(2)
+        self.wait_circle_direction(circle_centre_loc, radius_m, ccw)
         self.wait_disarmed()
+
+    def mission_NAV_LOITER_TURNS(self):
+        '''test that loiter turns basically works'''
+        self.fly_mission_NAV_LOITER_TURNS()
+
+    def mission_NAV_LOITER_TURNS_ccw(self):
+        '''test that a negative loiter radius gives a counter-clockwise circle'''
+        self.fly_mission_NAV_LOITER_TURNS(ccw=True)
 
     def mission_NAV_LOITER_TURNS_off_center(self):
         '''test that loiter turns basically works - copter on edge of circle'''
         self.start_subtest("Start circle when on edge of circle")
-        radius = 30
+        radius_m = 30
         self.wait_ready_to_arm()
         here = self.get_location()
-        circle_centre_loc = self.offset_location_ne(here, radius, 0)
-        self.upload_simple_relhome_mission([
-            (mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 20),
-            self.create_MISSION_ITEM_INT(
-                mavutil.mavlink.MAV_CMD_NAV_LOITER_TURNS,
-                p1=1,
-                p3=radius,
-                x=int(circle_centre_loc.lat*1e7),
-                y=int(circle_centre_loc.lng*1e7),
-                z=30,  # circle is 10m higher than takeoff
-                frame=mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
-            ),
-            (mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH, 0, 0, 0),
-        ])
-        self.change_mode('AUTO')
-        self.set_parameter('AUTO_OPTIONS', 3)
-        self.wait_ready_to_arm()
-        self.arm_vehicle()
-        self.wait_disarmed()
+        self.fly_mission_NAV_LOITER_TURNS(
+            circle_centre_loc=self.offset_location_ne(here, radius_m, 0),
+            radius_m=radius_m,
+        )
 
     def mission_NAV_LOITER_TURNS_speed(self):
         '''LOITER_TURNS orbits at WP_SPD, not at CIRCLE_RATE * radius'''
@@ -23964,6 +24013,7 @@ return update, 1000
             self.FenceRelativeToAMSLCliff,
             self.PositionWhenGPSIsZero,
             self.mission_NAV_LOITER_TURNS,
+            self.mission_NAV_LOITER_TURNS_ccw,
             self.mission_NAV_LOITER_TURNS_speed,
             Test(self.GyroFFT, attempts=1, speedup=8),
             self.CompassReordering,
