@@ -40,7 +40,7 @@
 -- ============================================================
 local EK3_SRC_GPS           = 0       -- EK3 gps source
 local EK3_SRC_OFW           = 1       -- EK3 optical flow source
-local UPDATE_RATE_MS        = 500     -- how often to check (ms)
+local UPDATE_RATE_MS        = 300     -- how often to check (ms)
 local UPDATE_RATE_S         = 1       -- how often to check (s)
 local GPS_BAD_DEBOUNCE_S    = 2.5     -- GPS must be bad for this many seconds before action
 local GPS_MIN_SATS          = 6       -- below this number of satellites = bad
@@ -177,6 +177,31 @@ local function update()
     -- auto loiter from RCx_FUNCTION = 300 (Scripting1)
     local rc_fn_auto_sw = rc:find_channel_for_option(300)
     
+    if rc_fn_source then
+        local sw_source = rc_fn_source:get_aux_switch_pos()
+        if sw_source ~= sw_source_prev then    -- check for changes in source switch position
+            sw_source_prev = sw_source         -- record new switch position so we can detect changes           
+
+            send_osd(SEV_INFO, string.format("FC Gaurd: EK3 SRC set to %d", sw_source_prev+1))
+        end
+    end
+
+    -- if auto switch exists then read position from RCx_FUNCTION = 300 (Scripting1)
+    if rc_fn_auto_sw then
+        local sw_auto_loit = rc_fn_auto_sw:get_aux_switch_pos()
+        if sw_auto_loit ~= sw_auto_switch_prev  then         -- check for changes in source auto switch position
+            sw_auto_switch_prev = sw_auto_loit               -- record new switch position so we can detect changes
+            
+            if sw_auto_loit == 0 then                        -- pilot has pulled switch low
+                auto_switch = false                          -- disable auto switching of source
+                send_osd(SEV_INFO, "FC Guard: Auto safety disabled")
+            elseif sw_auto_loit == 2 then                    -- pilot has pulled switch high
+                auto_switch = true                           -- enable auto switching of source
+                send_osd(SEV_INFO, "FC Gaurd: Auto safety enabled")
+            end
+        end
+    end
+
     -- Only when armed
     if not arming:is_armed() then
 
@@ -205,33 +230,6 @@ local function update()
     local gps_ok = is_gps_good()
     local of_ok  = is_optical_flow_usable()
 
-    if rc_fn_source then
-        local sw_source = rc_fn_source:get_aux_switch_pos()
-        if sw_source ~= sw_source_prev then    -- check for changes in source switch position
-            sw_source_prev = sw_source         -- record new switch position so we can detect changes           
-
-            send_osd(SEV_INFO, "FC Gaurd: EK3 SRC set to → " .. string.format("%d", sw_source_prev+1))
-        else    
-            send_osd(SEV_INFO, string.format("FC Gaurd: EK3 SRC → %d already set", sw_source_prev+1))
-        end
-    end
-
-    -- if auto switch exists then read position from RCx_FUNCTION = 300 (Scripting1)
-    if rc_fn_auto_sw then
-        local sw_auto_loit = rc_fn_auto_sw:get_aux_switch_pos()
-        if sw_auto_loit ~= sw_auto_switch_prev  then         -- check for changes in source auto switch position
-            sw_auto_switch_prev = sw_auto_loit               -- record new switch position so we can detect changes
-            
-            if sw_auto_loit == 0 then                        -- pilot has pulled switch low
-                auto_switch = false                          -- disable auto switching of source
-                send_osd(SEV_INFO, "FC Guard: Auto switching disabled")
-            elseif sw_auto_loit == 2 then                    -- pilot has pulled switch high
-                auto_switch = true                           -- enable auto switching of source
-                send_osd(SEV_INFO, "FC Gaurd: Auto switching enabled")
-            end
-        end
-    end
-
     -- ========================================================
     -- LOCKED STATE (OF Loiter)
     -- ========================================================
@@ -243,7 +241,7 @@ local function update()
             unlock_cooldown_until = now_ms + (UNLOCK_COOLDOWN_S * 1000)
             
             switch_to_source(sw_source_prev)
-            send_osd(SEV_NOTICE, "FC Guard: pilot unlocked → SRC " .. string.format("%d", sw_source_prev+1))
+            send_osd(SEV_NOTICE, string.format("FC Guard: pilot unlocked → SRC %d", sw_source_prev+1))
 
             last_mode = current_mode
             return update, UPDATE_RATE_MS
