@@ -2220,6 +2220,13 @@ class AutoTestPlane(vehicle_test_suite.TestSuite):
             max_allowed_divergence = 300
         else:
             max_allowed_divergence = 150
+        # sample the published position as fast as the link allows; a
+        # position glitch can last a single AHRS cycle, which the default
+        # 10Hz GLOBAL_POSITION_INT rate usually steps over.  0.8*loop rate
+        # is the fastest a message may be streamed:
+        fast_rate_hz = int(0.8 * self.get_parameter("SCHED_LOOP_RATE"))
+        self.set_message_rate_hz('GLOBAL_POSITION_INT', fast_rate_hz)
+        self.set_message_rate_hz('SIMSTATE', fast_rate_hz)
         self.install_message_hook_context(vehicle_test_suite.TestSuite.ValidateGlobalPositionIntAgainstSimState(self, max_allowed_divergence=max_allowed_divergence))  # noqa
 
         try:
@@ -7275,6 +7282,47 @@ return update()
             else:
                 raise NotAchievedException("Missing trick %s" % t)
 
+    def AcroLocking(self):
+        '''Plane acro-locking mode'''
+
+        model = "plane-3d"
+
+        self.customise_SITL_commandline(
+            [],
+            model=model,
+            defaults_filepath="Tools/autotest/models/plane-3d.parm",
+            wipe=True)
+        self.set_parameters({
+            'ACRO_LOCKING': 2,
+        })
+
+        self.takeoff(150, mode='TAKEOFF', timeout=120)
+        self.change_mode('ACRO')
+
+        self.set_rc(3, 2000)
+
+        self.progress("Pitching")
+        self.set_rc(2, 1700)
+        self.wait_pitch(20, accuracy=5)
+        self.set_rc(2, 1500)
+
+        self.progress("Rolling")
+        self.set_rc(1, 1550)
+        self.wait_roll(90, accuracy=2)
+        self.set_rc(1, 1500)
+        self.wait_roll(90, accuracy=5, minimum_duration=20)
+        # introduce some servo trim error to make sure acro mode does
+        # its job
+        self.context_push()
+        self.set_parameters({
+            "SERVO1_TRIM": 1550,
+        })
+        self.wait_roll(90, accuracy=5, minimum_duration=20, timeout=60)
+        self.context_pop()
+
+        self.set_rc(3, 1000)
+        self.disarm_vehicle(force=True)
+
     def UniversalAutoLandScript(self):
         '''Test UniversalAutoLandScript'''
         applet_script = "UniversalAutoLand.lua"
@@ -10754,6 +10802,7 @@ return update()
             self.MAV_CMD_NAV_LOITER_TO_ALT,
             self.TerrainMission,
             self.TerrainMissionInterrupt,
+            self.AcroLocking,
             self.InertialLabsEAHRS,
             self.KebniSensAItionExternalIMU,
             self.GpsSensorPreArmEAHRS,

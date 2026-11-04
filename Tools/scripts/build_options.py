@@ -60,6 +60,7 @@ BUILD_OPTIONS = [
     Feature('AHRS', 'EKF3_WINDEST', 'EK3_FEATURE_DRAG_FUSION', 'Enable Wind estimation for EKF3', 0, 'EKF3'),
     Feature('AHRS', 'EKF3_OPTFLOW', 'EK3_FEATURE_OPTFLOW_FUSION', 'Enable OpticalFlow fusion for EKF3', 0, 'EKF3,OPTICALFLOW'),
     Feature('AHRS', 'EKF3_OPTFLOW_SRTM', 'EK3_FEATURE_OPTFLOW_SRTM', 'Enable OpticalFlow using SRTM for EKF3', 0, 'EKF3_OPTFLOW'),  # noqa: E501
+    Feature('AHRS', 'EKF3_OPTFLOW_AGL_KF', 'EK3_FEATURE_OPTFLOW_AGL_KF', 'Enable OpticalFlow AGL Kalman filter for EKF3', 0, 'EKF3_OPTFLOW'),  # noqa: E501
     Feature('AHRS', 'EKF3_RESET', 'AP_AHRS_EKF_RESET_ENABLED', 'Enable EKF bootstrap reset aux function', 1, 'EKF3'),
     Feature('AHRS', 'AHRS_POS_RESET', 'AP_AHRS_POSITION_RESET_ENABLED', 'Enable setting position from external position estimates', 0, 'EKF3'),  # noqa: E501
     Feature('AHRS', 'BARO_WIND_COMP', 'HAL_BARO_WIND_COMP_ENABLED', 'Enable Baro wind compensation', 0, None),
@@ -486,6 +487,7 @@ BUILD_OPTIONS = [
     Feature('Developer', 'KILL_IMU', 'AP_INERTIALSENSOR_KILL_IMU_ENABLED', 'Allow IMUs to be disabled at runtime', 0, None),
     Feature('Developer', 'CRASHDUMP_FLASH', 'AP_CRASHDUMP_FLASH_ENABLED', 'Enable crash dumps to flash', 0, None),
     Feature('Developer', 'CRASHDUMP_FATFS', 'AP_CRASHDUMP_FATFS_ENABLED', 'Enable crash dumps to microSD', 0, None),
+    Feature('Developer', 'MEMPROTECT_TRACE', 'AP_BOARDCONFIG_MCU_MEMPROTECT_TRACE_ENABLED', 'Enable trapping and logging of null pointer accesses (H7 with internal flash only)', 1, None),  # noqa:E501
     Feature('Developer', 'FAILURE_INJECTION', 'AP_MAVLINK_FAILURE_CREATION_ENABLED', 'Enable autopilot failure injection via MAVLink ', 0, None),  # noqa:E501
 
     Feature('GPS Drivers', 'UBLOX', 'AP_GPS_UBLOX_ENABLED', 'Enable U-blox GPS', 1, None),

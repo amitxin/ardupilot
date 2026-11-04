@@ -8113,7 +8113,9 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             "WVANE_ENABLE": 1,
             "WVANE_GAIN": 3,
             "WVANE_VELZ_MAX": 1,
-            "WVANE_SPD_MAX": 2
+            "WVANE_SPD_MAX": 2,
+            # the roll deadzone leaves the heading settled short of the wind
+            "WVANE_ANG_MIN": 0,
         })
 
         self.progress("Test weathervaning in auto")
@@ -8136,13 +8138,13 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.arm_vehicle()
         self.user_takeoff(alt_min=15)
         # Wait for heading to match wind direction.
-        self.wait_heading(100, accuracy=8, timeout=100)
+        self.wait_heading(100, accuracy=5, minimum_duration=10, timeout=100)
 
         self.progress("Test weathervaning in guided pos only")
         # Travel directly north to align heading north and build some airspeed.
         self.fly_guided_move_local(x=40, y=0, z_up=15)
         # Wait for heading to match wind direction.
-        self.wait_heading(100, accuracy=8, timeout=100)
+        self.wait_heading(100, accuracy=5, minimum_duration=10, timeout=100)
         self.do_RTL()
 
     def _DO_WINCH(self, command):
@@ -8982,10 +8984,37 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
 
         self.do_RTL()
 
+    def assert_mount_retracted(self, retracted):
+        '''assert whether GIMBAL_DEVICE_ATTITUDE_STATUS reports the mount retracted'''
+        self.drain_mav()
+        m = self.assert_receive_message('GIMBAL_DEVICE_ATTITUDE_STATUS', timeout=5)
+        is_retracted = bool(m.flags & mavutil.mavlink.GIMBAL_DEVICE_FLAGS_RETRACT)
+        if is_retracted != retracted:
+            raise NotAchievedException(f"Expected retracted={retracted} got flags={m.flags}")
+
+    def test_mount_configure_invalid_modes(self):
+        '''check DO_MOUNT_CONFIGURE denies invalid modes without changing mode'''
+        self.set_mount_mode(mavutil.mavlink.MAV_MOUNT_MODE_RC_TARGETING)
+        self.assert_mount_retracted(False)
+        # 256 would truncate to RETRACT if converted to uint8_t unchecked
+        for mode in 8, 255, 256, -1, float('nan'), float('inf'), float('-inf'):
+            for run_cmd in self.run_cmd, self.run_cmd_int:
+                run_cmd(
+                    mavutil.mavlink.MAV_CMD_DO_MOUNT_CONFIGURE,
+                    p1=mode,
+                    want_result=mavutil.mavlink.MAV_RESULT_DENIED,
+                )
+        self.assert_mount_retracted(False)
+        # make sure the check above can detect a retracted mount
+        self.set_mount_mode(mavutil.mavlink.MAV_MOUNT_MODE_RETRACT)
+        self.assert_mount_retracted(True)
+        self.set_mount_mode(mavutil.mavlink.MAV_MOUNT_MODE_RC_TARGETING)
+
     def Mount(self):
         '''test servo mount'''
         self.setup_servo_mount()
         self.reboot_sitl() # to handle MNT_TYPE changing
+        self.test_mount_configure_invalid_modes()
         self.mount_test_body()
 
     def MountRCFailAngle(self):
@@ -16045,6 +16074,83 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             self.start_subtest("active EKF type %u" % active_type)
             self.gsf_reset_for_ekf_type(active_type)
 
+    def OSDParamConfig(self):
+        '''test OSD parameter screen configuration over MAVLink and stick menu'''
+        self.set_parameters({
+            "SERIAL5_PROTOCOL": 42,  # MSP DisplayPort
+            "OSD_TYPE": 5,           # MSP DisplayPort
+            "OSD1_ENABLE": 0,
+            "OSD5_ENABLE": 1,
+            "OSD_CHAN": 12,
+            "OSD_SW_METHOD": 1,      # select screen by PWM range
+        })
+        port = self.spare_network_port()
+        self.customise_SITL_commandline([
+            "--serial5=tcp:%u" % port  # serial5 listens on localhost port
+        ])
+        self.set_rc(12, 1500)
+        # arming is blocked while the parameter screen is displayed
+        self.wait_statustext("PreArm: In OSD menu", timeout=60)
+
+        screen = 5  # first parameter screen
+        request_id = 0
+
+        def show_config(index):
+            nonlocal request_id
+            request_id += 1
+            self.mav.mav.osd_param_show_config_send(1, 1, request_id, screen, index)
+            return self.assert_receive_message(
+                'OSD_PARAM_SHOW_CONFIG_REPLY',
+                condition='OSD_PARAM_SHOW_CONFIG_REPLY.request_id==%u' % request_id,
+                timeout=5,
+                verbose=True,
+            )
+
+        def show_config_name(index):
+            m = show_config(index)
+            if m.result != mavutil.mavlink.OSD_PARAM_SUCCESS:
+                raise NotAchievedException("Bad OSD_PARAM_SHOW_CONFIG result %u" % m.result)
+            return m.param_id
+
+        self.start_subtest("Read the default parameter slot")
+        show_config_name(1)
+
+        self.start_subtest("Configure a slot to the first parameter")
+        request_id += 1
+        self.mav.mav.osd_param_config_send(1, 1, request_id, screen, 1, "FORMAT_VERSION".encode('ascii'), 0, 0, 0, 0)
+        m = self.assert_receive_message(
+            'OSD_PARAM_CONFIG_REPLY',
+            condition='OSD_PARAM_CONFIG_REPLY.request_id==%u' % request_id,
+            timeout=5,
+        )
+        if m.result != mavutil.mavlink.OSD_PARAM_SUCCESS:
+            raise NotAchievedException("Bad OSD_PARAM_CONFIG result %u" % m.result)
+        name = show_config_name(1)
+        if name != "FORMAT_VERSION":
+            raise NotAchievedException("Expected FORMAT_VERSION got %s" % name)
+
+        self.start_subtest("Enter parameter selection on the OSD menu")
+        # menu gestures need throttle low and yaw centred
+        self.set_rc_from_map({1: 1500, 2: 1500, 3: 1000, 4: 1500})
+        # hold MENU_ENTER to go from value modify to parameter modify
+        self.set_rc(1, 2000)
+        self.delay_sim_time(5, reason="MENU_ENTER hold")
+        self.set_rc(1, 1500)
+        self.delay_sim_time(1, reason="stick re-centre")
+
+        self.start_subtest("Holding MENU_UP from the first parameter")
+        # MENU_UP from either of the first two parameters selects the second
+        # one, and both paths start from the initial previous-token values
+        self.set_rc(2, 1000)
+        self.delay_sim_time(5, reason="MENU_UP hold")
+        self.set_rc(2, 1500)
+        self.delay_sim_time(1, reason="stick re-centre")
+        name = show_config_name(1)
+        if name != "PILOT_THR_FILT":
+            raise NotAchievedException("Expected PILOT_THR_FILT got %s" % name)
+
+        self.reboot_sitl()
+
     def EKFBootstrapReset(self):
         '''verify EKF reset aux switch is disarmed-only and preserves origin'''
         self.set_parameters({
@@ -17701,6 +17807,25 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         )
         self.takeoff(10, mode='GUIDED')
         self.do_RTL()
+
+    def ModelDefaults(self):
+        '''check SITL loads the default parameters for each --model'''
+        # firmware defaults: FRAME_CLASS 0, FRAME_TYPE 1, ACRO_RP_RATE 360, ACRO_Y_RATE 202.5
+        callisto = {"FRAME_CLASS": 4, "FRAME_TYPE": 14, "ACRO_Y_RATE": 90}
+        for model, expected in [
+                ("quad", {"FRAME_CLASS": 1, "FRAME_TYPE": 0}),
+                ("X", {"FRAME_CLASS": 1, "FRAME_TYPE": 1}),
+                # a frame name selects the frame's own model
+                ("Callisto", callisto),
+                ("freestyle", {"FRAME_CLASS": 1, "FRAME_TYPE": 1, "ACRO_RP_RATE": 533}),
+                # a frame's model string
+                ("octa-quad-cwx:@ROMFS/models/Callisto.json", callisto),
+                # ":<args>" is dropped to find the frame
+                ("quad:@ROMFS/models/freestyle.json", {"FRAME_CLASS": 1, "FRAME_TYPE": 0, "ACRO_RP_RATE": 360}),
+        ]:
+            self.start_subtest(model)
+            self.customise_SITL_commandline([], model=model, wipe=True)
+            self.assert_parameter_values(expected)
 
     def FlyEachFrame(self):
         '''Fly each supported internal frame'''
@@ -20540,6 +20665,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             self.RTLYaw,
             self.DataFlash,
             self.Callisto,
+            self.ModelDefaults,
             self.ModeAllowsEntryWhenNoPilotInput,
             self.WP_SPEED_UP,
             self.DO_WINCH,
@@ -22158,9 +22284,12 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             'SIM_WIND_SPD': 10,
             'SIM_WIND_DIR': 90,
             'WVANE_ENABLE': 1,
+            # the roll deadzone leaves the heading settled short of the wind
+            'WVANE_ANG_MIN': 0,
         })
         self.takeoff(20, mode='GUIDED')
-        self.guided_achieve_heading(0, direction=1, accuracy=1)
+        # turn the shortest way; forcing one can need more than the time allowed
+        self.guided_achieve_heading(0, accuracy=1)
 
         self.set_parameter("GUID_OPTIONS", 128)
         self.wait_heading(90, timeout=60, minimum_duration=10)
@@ -24749,6 +24878,7 @@ return update, 1000
             self.GyroFFTMotorNoiseCheck,
             self.MSPVTXConfig,
             self.MSPDisplayPortVTXConfig,
+            self.OSDParamConfig,
             self.EKFBootstrapReset,
             self.RTL_ALT_FINAL_M,
             self.MissionRTLAltFinalContinue,

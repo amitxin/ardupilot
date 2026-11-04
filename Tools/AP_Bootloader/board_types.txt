@@ -360,6 +360,7 @@ AP_HW_CORVON_V6                      1230
 
 
 # IDs 1231-1240 reserved for YARI Robotics
+AP_HW_YARIV6S                        1233
 AP_HW_YARIV6X                        1234
 AP_HW_YARI_GNSS                      1235
 AP_HW_YARI_RTK_GNSS                  1236
@@ -439,6 +440,7 @@ AP_HW_BCUBEF745V2                    1511
 
 AP_HW_HGLRCF405V4                    1524
 AP_HW_HGLRC_H743_EVO                 1525
+AP_HW_HGLRC_H743_PRO                 1526
 
 AP_HW_F4BY_F427                      1530
 AP_HW_F4BY_H743                      1531

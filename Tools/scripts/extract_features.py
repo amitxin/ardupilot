@@ -242,6 +242,7 @@ class ExtractFeatures(BuildScriptBase):
             ('EK3_FEATURE_DRAG_FUSION', r'NavEKF3_core::FuseDragForces'),
             ('EK3_FEATURE_OPTFLOW_FUSION', r'NavEKF3_core::FuseOptFlow'),
             ('EK3_FEATURE_OPTFLOW_SRTM', r'NavEKF3_core::writeTerrainData'),
+            ('EK3_FEATURE_OPTFLOW_AGL_KF', r'NavEKF3_core::UpdateAglKf'),
             ('AP_AHRS_EKF_RESET_ENABLED', r'AP_AHRS::reset_configured_backend'),
             ('AP_AHRS_POSITION_RESET_ENABLED', r'AP_AHRS::handle_external_position_estimate'),
 
@@ -264,6 +265,7 @@ class ExtractFeatures(BuildScriptBase):
             ('AP_INERTIALSENSOR_KILL_IMU_ENABLED', r'AP_InertialSensor::kill_imu'),
             ('AP_CRASHDUMP_FLASH_ENABLED', 'crashdump_flash_start'),
             ('AP_CRASHDUMP_FATFS_ENABLED', 'crashdump_sd_init'),
+            ('AP_BOARDCONFIG_MCU_MEMPROTECT_TRACE_ENABLED', 'memprotect_handle_fault'),
             ('AP_MAVLINK_FAILURE_CREATION_ENABLED', 'GCS_MAVLINK::deadlock_sem'),
             ('AP_CAN_SLCAN_ENABLED', 'SLCAN::CANIface::var_info'),
             ('AP_ADSB_AVOIDANCE_ENABLED', 'AP_Avoidance::init'),
