@@ -265,6 +265,7 @@ void NavEKF3_core::ResetPositionD(ftype posD)
     for (uint8_t i=0; i<imu_buffer_length; i++) {
         storedOutput[i].position.z += posResetD;
     }
+    flowFocusRngPosD += posResetD;
 
     posDResetCount++;
 }
@@ -295,6 +296,7 @@ void NavEKF3_core::ResetHeight(void)
 
     // Calculate the position jump due to the reset
     posResetD = stateStruct.position.z - posResetD;
+    flowFocusRngPosD += posResetD;
 
     posDResetCount++;
 
@@ -363,7 +365,9 @@ bool NavEKF3_core::resetHeightDatum(void)
     // clear the baro data buffer
     storedBaro.reset();
 
-    // reset the vertical position and velocity states
+    // reset the vertical position and velocity states.  The carried range sample
+    // moves with the datum: the ground did not shift relative to the vehicle
+    flowFocusRngPosD += oldHgt;
     stateStruct.position.z = 0.0f;
     stateStruct.velocity.z = 0.0f;
     for (uint8_t i=0; i<imu_buffer_length; i++) {
@@ -1032,6 +1036,9 @@ void NavEKF3_core::FuseVelPosNED()
             if (hgtTestRatio < maxTestRatio) {
                 hgtCheckPassed = true;
                 lastHgtPassTime_ms = imuSampleTime_ms;
+                if (activeHgtSource == AP_NavEKF_Source::SourceZ::RANGEFINDER) {
+                    lastRngHgtPassTime_ms = imuSampleTime_ms;
+                }
             } else if ((frontend->_gpsGlitchRadiusMax <= 0) && !onGroundNotNavigating && (activeHgtSource == AP_NavEKF_Source::SourceZ::GPS)) {
                 // Handle the special case where the glitch radius parameter has been set to a non-positive number.
                 // The innovation variance is increased to limit the state update to an amount corresponding

@@ -283,7 +283,7 @@ public:
     // msecFlowMeas is the scheduler time in msec when the optical flow data was received from the sensor.
     // posOffset is the XYZ flow sensor position in the body frame in m
     // heightOverride is the fixed height of the sensor above ground in m, when on rover vehicles. 0 if not used
-    void writeOptFlowMeas(const uint8_t rawFlowQuality, const Vector2f &rawFlowRates, const Vector2f &rawGyroRates, const uint32_t msecFlowMeas, const Vector3f &posOffset, float heightOverride);
+    void writeOptFlowMeas(const uint8_t rawFlowQuality, const Vector2f &rawFlowRates, const Vector2f &rawGyroRates, const uint32_t msecFlowMeas, const Vector3f &posOffset, float heightOverride, float minHeight);
 
     // retrieve latest corrected optical flow samples (used for calibration)
     bool getOptFlowSample(uint32_t& timeStamp_ms, Vector2f& flowRate, Vector2f& bodyRate, Vector2f& losPred) const;
@@ -646,6 +646,7 @@ private:
         Vector3F    bodyRadXYZ;     // body frame XYZ axis angular rates averaged across the optical flow measurement interval (rad/sec)
         Vector3F    body_offset;    // XYZ position of the optical flow sensor in body frame (m)
         float       heightOverride; // The fixed height of the sensor above ground in m, when on rover vehicles. 0 if not used
+        float       minHeight;      // height above ground below which the sensor cannot focus (m). 0 if not used
     };
 
     struct vel_odm_elements : EKF_obs_element_t {
@@ -939,7 +940,7 @@ private:
     void SelectBodyOdomFusion();
 
     // Estimate terrain offset using a single state EKF
-    void EstimateTerrainOffset(const of_elements &ofDataDelayed);
+    void EstimateTerrainOffset(const of_elements &ofDataDelayed, bool flowDataToFuse);
 
 #if EK3_FEATURE_OPTFLOW_AGL_KF
     // Update the 2-state IMU-aided AGL Kalman filter (height + vertical velocity above ground)
@@ -1181,6 +1182,9 @@ private:
     uint32_t lastVelPassTime_ms;    // time stamp when GPS velocity measurement last passed innovation consistency check (msec)
     uint32_t lastGpsPosPassTime_ms;    // time stamp when GPS position measurement last passed innovation consistency check (msec)
     uint32_t lastHgtPassTime_ms;    // time stamp when height measurement last passed innovation consistency check (msec)
+    uint32_t lastRngHgtPassTime_ms; // time stamp when range finder height last passed innovation consistency check (msec)
+    uint32_t lastTasPassTime_ms;    // time stamp when airspeed measurement last passed innovation consistency check (msec)
+    uint32_t lastTasFailTime_ms;    // time stamp when airspeed measurement last failed innovation consistency check (msec)
     uint32_t lastTimeGpsReceived_ms;// last time we received GPS data
     uint32_t timeAtLastAuxEKF_ms;   // last time the auxiliary filter was run to fuse range or optical flow measurements
     uint32_t lastHealthyMagTime_ms; // time the magnetometer was last declared healthy
@@ -1324,6 +1328,15 @@ private:
     Vector2F auxFlowObsInnov;       // optical flow rate innovation from 1-state terrain offset estimator
     uint32_t flowValidMeaTime_ms;   // time stamp from latest valid flow measurement (msec)
     uint32_t rngValidMeaTime_ms;    // time stamp from latest valid range measurement (msec)
+#if EK3_FEATURE_RANGEFINDER_MEASUREMENTS
+    uint32_t rngOutOfRangeLowTime_ms[DOWNWARD_RANGEFINDER_MAX_INSTANCES]; // time stamps of the latest out of range low report from each downward range finder (msec)
+#endif
+    ftype flowFocusRngAgl;          // tilt corrected range of the latest range sample recalled, for the flow focus height check (m)
+    ftype flowFocusRngPosD;         // vertical position when that range sample was recalled, moved with height resets (m)
+    bool flowFocusRngValid;         // a range sample has been recalled for the flow focus height check
+    bool flowFocusBelow;            // optical flow is held off below its focus height
+    bool flowFocusResting;          // the range finder says the vehicle is on the ground, so held-off flow is fused as zero
+    ftype flowFocusRestRng;         // range read on the ground before this flight's takeoff, under the focus floor, or 0 (m)
     uint32_t flowMeaTime_ms;        // time stamp from latest flow measurement (msec)
     uint32_t gndHgtValidTime_ms;    // time stamp from last terrain offset state update (msec)
     Vector2 flowVarInnov;           // optical flow innovations variances (rad/sec)^2
