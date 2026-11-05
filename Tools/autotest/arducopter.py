@@ -14,6 +14,7 @@ import pathlib
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import tempfile
 import time
@@ -3756,6 +3757,151 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             }, timeout=10)
             self.set_parameter("SIM_GPS1_FIXTYPE", 6)
             self.wait_ready_to_arm()
+
+    # values for SIM_GPSn_UBXMDL
+    UBX_MODEL_UBLOX6 = 1
+    UBX_MODEL_M8N_FW201 = 2
+    UBX_MODEL_M8_ROM301 = 3
+    UBX_MODEL_M8N_SPG301 = 4
+    UBX_MODEL_M9N_SPG404 = 5
+    UBX_MODEL_M10_SPG510 = 6
+
+    def ublox_sim_config_filepath(self):
+        '''the file the simulated u-blox keeps its saved configuration in'''
+        return os.path.join(os.getcwd(), "sim_ublox_gps1.bin")
+
+    def ublox_sim_reset_saved_config(self):
+        '''return the simulated u-blox to factory configuration at next boot'''
+        filepath = self.ublox_sim_config_filepath()
+        if os.path.exists(filepath):
+            os.unlink(filepath)
+
+    # offset of the NAV-SOL rate in the simulator's saved configuration
+    # file: magic(4), model(1), then the rates of the tracked messages
+    UBX_SIM_NAV_SOL_RATE_OFFSET = 5 + 3
+
+    def ublox_sim_saved_nav_sol_rate(self):
+        '''return the NAV-SOL rate in the simulated u-blox's saved configuration'''
+        with open(self.ublox_sim_config_filepath(), "rb") as f:
+            data = f.read()
+        (magic, ) = struct.unpack("<I", data[0:4])
+        if magic != 0x55425853:
+            raise NotAchievedException("Bad magic in saved u-blox config")
+        return data[self.UBX_SIM_NAV_SOL_RATE_OFFSET]
+
+    # offset of CFG-SIGNAL-BDS_B1C_ENA in the saved configuration file:
+    # after the rates come measure/nav rate and timeref (6), NAV5 (36),
+    # SBAS (8), GNSS length and settings (1+60), then the
+    # CFG-VALSET keys, of which this is the sixth
+    UBX_SIM_BDS_B1C_ENA_OFFSET = 5 + 14 + 6 + 36 + 8 + 1 + 60 + 5
+
+    def ublox_sim_saved_bds_b1c_ena(self):
+        '''return CFG-SIGNAL-BDS_B1C_ENA from the simulated u-blox's saved configuration'''
+        with open(self.ublox_sim_config_filepath(), "rb") as f:
+            data = f.read()
+        return data[self.UBX_SIM_BDS_B1C_ENA_OFFSET]
+
+    def ublox_sim_set_saved_nav_sol_rate(self, rate):
+        '''set the NAV-SOL rate in the simulated u-blox's saved
+        configuration, as another tool (e.g. u-center) might'''
+        filepath = self.ublox_sim_config_filepath()
+        with open(filepath, "rb") as f:
+            data = bytearray(f.read())
+        data[self.UBX_SIM_NAV_SOL_RATE_OFFSET] = rate
+        with open(filepath, "wb") as f:
+            f.write(data)
+
+    def ublox_sim_boot(self, settle_time=40):
+        '''reboot, wait for the u-blox to be detected and configured,
+        return the text of the STATUSTEXTs received'''
+        self.context_clear_collection('STATUSTEXT')
+        self.reboot_sitl()
+        self.wait_statustext("detected u-blox", check_context=True, timeout=60)
+        self.delay_sim_time(settle_time, reason="let the u-blox driver configure the receiver")
+        texts = [m.text for m in self.context_collection('STATUSTEXT')]
+        counts = {}
+        for text in texts:
+            if "u-blox" in text:
+                counts[text] = counts.get(text, 0) + 1
+        for (text, count) in counts.items():
+            self.progress("  %ux %s" % (count, text))
+        return texts
+
+    def ublox_sim_count_saves(self, texts):
+        return len([t for t in texts if "u-blox saving config" in t])
+
+    def UBloxNoSaveEveryBoot(self):
+        '''check u-blox receivers are not told to save their configuration on every boot'''
+        self.context_push()
+        self.context_collect('STATUSTEXT')
+        self.set_parameters({
+            "GPS_AUTO_CONFIG": 1,
+            "GPS_SAVE_CFG": 2,
+        })
+        for (model, name) in [
+                (self.UBX_MODEL_UBLOX6, "u-blox 6 FW 7.03"),
+                (self.UBX_MODEL_M8N_FW201, "NEO-M8N FW 2.01"),
+                (self.UBX_MODEL_M8_ROM301, "M8 ROM CORE 3.01"),
+                (self.UBX_MODEL_M8N_SPG301, "NEO-M8N SPG 3.01"),
+                (self.UBX_MODEL_M9N_SPG404, "NEO-M9N SPG 4.04"),
+                (self.UBX_MODEL_M10_SPG510, "M10 ROM SPG 5.10"),
+        ]:
+            self.start_subtest(name)
+            self.set_parameter("SIM_GPS1_UBXMDL", model)
+            self.ublox_sim_reset_saved_config()
+            self.progress("Boot with the receiver at factory configuration")
+            saves = self.ublox_sim_count_saves(self.ublox_sim_boot())
+            if saves != 1:
+                raise NotAchievedException("Expected one u-blox configuration save from factory configuration, got %u" % saves)
+            nav_sol_rate = self.ublox_sim_saved_nav_sol_rate()
+            self.progress("Saved NAV-SOL rate: %u" % nav_sol_rate)
+            if model != self.UBX_MODEL_UBLOX6 and nav_sol_rate != 0:
+                raise NotAchievedException("NAV-SOL enabled in saved configuration")
+            if model == self.UBX_MODEL_M10_SPG510:
+                # the M10 is configured through CFG-VALSET; check that
+                # reached the saved configuration
+                if self.ublox_sim_saved_bds_b1c_ena() != 1:
+                    raise NotAchievedException("M10 CFG-VALSET settings not saved")
+            for i in range(2):
+                self.progress("Boot with the receiver configured (%u)" % i)
+                saves = self.ublox_sim_count_saves(self.ublox_sim_boot())
+                if saves != 0:
+                    raise NotAchievedException("u-blox configuration saved %u times on boot" % saves)
+        self.context_pop()
+        self.ublox_sim_reset_saved_config()
+        self.reboot_sitl()
+
+    def UBloxNavSolInSavedConfig(self):
+        '''check NAV-SOL enabled in a u-blox's saved configuration is turned off by the next save'''
+        self.context_push()
+        self.context_collect('STATUSTEXT')
+        self.set_parameters({
+            "GPS_AUTO_CONFIG": 1,
+            "GPS_SAVE_CFG": 2,
+            "SIM_GPS1_UBXMDL": self.UBX_MODEL_M8N_SPG301,
+        })
+        self.ublox_sim_reset_saved_config()
+        self.ublox_sim_boot()
+
+        self.start_subtest("NAV-SOL enabled in saved configuration alone doesn't cause a save")
+        self.ublox_sim_set_saved_nav_sol_rate(1)
+        saves = self.ublox_sim_count_saves(self.ublox_sim_boot())
+        if saves != 0:
+            raise NotAchievedException("u-blox configuration saved %u times on boot" % saves)
+        if self.ublox_sim_saved_nav_sol_rate() != 1:
+            raise NotAchievedException("Saved NAV-SOL rate changed without a save")
+
+        self.start_subtest("A save for another reason turns NAV-SOL off")
+        self.set_parameter("GPS_NAVFILTER", 7)
+        saves = self.ublox_sim_count_saves(self.ublox_sim_boot())
+        if saves != 1:
+            raise NotAchievedException("Expected one u-blox configuration save, got %u" % saves)
+        if self.ublox_sim_saved_nav_sol_rate() != 0:
+            raise NotAchievedException("NAV-SOL still enabled in saved configuration")
+
+        self.context_pop()
+        self.ublox_sim_reset_saved_config()
+        self.reboot_sitl()
 
     #   SimpleMode - test simple mode flies North regardless of vehicle heading
     def SimpleMode(self):
@@ -15549,6 +15695,101 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.wait_current_waypoint(0, timeout=10)
         self.set_rc(7, 1000)
 
+    def PowerOff(self):
+        '''Test the shutdown command function'''
+        self.set_parameter("SERIAL2_PROTOCOL", 2)
+        self.reboot_sitl()
+        self.wait_ready_to_arm()
+
+        # a component sharing our system ID should be told the vehicle
+        # is powering off:
+        saved_mavfile_global = mavutil.mavfile_global
+        component = mavutil.mavlink_connection(
+            self.sitl_serial_endpoint(2),
+            source_system=self.sysid_thismav(),
+            source_component=mavutil.mavlink.MAV_COMP_ID_ONBOARD_COMPUTER,
+        )
+        mavutil.mavfile_global = saved_mavfile_global
+        poweroff_commands = []
+
+        def drain_component():
+            while (m := component.recv_match()) is not None:
+                if (m.get_type() == 'COMMAND_LONG' and
+                        m.command == mavutil.mavlink.MAV_CMD_POWER_OFF_INITIATED):
+                    poweroff_commands.append(m)
+
+        try:
+            # let the autopilot learn a route to the component:
+            for i in range(3):
+                component.mav.heartbeat_send(
+                    mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER,
+                    mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                    0, 0, 0)
+                self.delay_sim_time(1, reason="autopilot to learn route to component")
+                drain_component()
+
+            self.context_collect('STATUSTEXT')
+            self.run_cmd(
+                mavutil.mavlink.MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN,
+                p1=2,  # REBOOT_SHUTDOWN_ACTION_SHUTDOWN
+            )
+            self.wait_statustext("Vehicle powering off", check_context=True)
+            poweroff_start = self.get_sim_time_cached()
+
+            # arming must be refused while the power off is pending,
+            # even when forced:
+            for p2 in 0, 2989:
+                self.run_cmd(
+                    mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                    p1=1,  # ARM
+                    p2=p2,
+                    want_result=mavutil.mavlink.MAV_RESULT_FAILED,
+                )
+            self.wait_statustext("Power off pending", check_context=True)
+
+            # SITL should stay up for AP_POWEROFF_DELAY_MS, then exit:
+            last_sim_time = poweroff_start
+            tstart = time.time()
+            # don't let pymavlink try to reconnect once SITL has gone:
+            old_autoreconnect = self.mav.autoreconnect
+            self.mav.autoreconnect = False
+            connection_lost = False
+            try:
+                while self.sitl.isalive():
+                    if time.time() - tstart > 60:
+                        raise NotAchievedException("SITL did not power off")
+                    self.drain_all_pexpects()
+                    if connection_lost:
+                        continue
+                    try:
+                        drain_component()
+                        if self.mav.recv_match(type='SYSTEM_TIME', blocking=True, timeout=0.1) is not None:
+                            last_sim_time = self.get_sim_time_cached()
+                    except ConnectionError:
+                        # SITL closes its sockets as it exits
+                        connection_lost = True
+            finally:
+                self.mav.autoreconnect = old_autoreconnect
+            if self.sitl.exitstatus != 0:
+                raise NotAchievedException("SITL exited with status %s" % str(self.sitl.exitstatus))
+            delay = last_sim_time - poweroff_start
+            self.progress("Powered off %.1fs after power off initiated" % delay, send_statustext=False)
+            if delay < 4 or delay > 6:
+                raise NotAchievedException("Unexpected power off delay %.1fs" % delay)
+
+            drain_component()
+            if len(poweroff_commands) != 1:
+                raise NotAchievedException(
+                    "Expected one MAV_CMD_POWER_OFF_INITIATED, got %u" % len(poweroff_commands))
+            if poweroff_commands[0].param1 != 0:
+                raise NotAchievedException(
+                    "Unexpected MAV_CMD_POWER_OFF_INITIATED param1 %f" % poweroff_commands[0].param1)
+        finally:
+            component.close()
+
+        # restart the vehicle with default parameters:
+        self.customise_SITL_commandline([], wipe=True)
+
     def AuxFunctionsInMission(self):
         '''Test use of auxiliary functions in missions'''
         self.load_mission("aux_functions.txt")
@@ -20462,6 +20703,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             self.MAV_CMD_CONDITION_YAW,
             self.SetModesViaAuxSwitch,
             self.AuxSwitchOptions,
+            self.PowerOff,
             self.BrakeMode,
             self.ThrottleFailsafePassthrough,
             self.ThrottleFailsafeValue,
@@ -22885,6 +23127,55 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             self.set_parameter("ARSPD_PRIMARY", primary)
             wait_ahrs_using_airspeed_sensor(primary)
 
+    def InvertedBoardBootAttitudeTarget(self):
+        '''check a board mounted upside-down does not get an inverted attitude target at boot'''
+        # A vehicle with AHRS_ORIENTATION=8 and EK3_PRIMARY=2 flipped
+        # on takeoff.  The boot gyro calibration left an accel sample
+        # without the board rotation applied, DCM aligned to it and so
+        # started inverted, and when the AHRS switched from DCM to
+        # EKF3 the attitude controller's inertial frame reset carried
+        # that 180 degree error into the attitude target.
+        self.set_parameters({
+            "AHRS_ORIENTATION": 8,  # ROTATION_ROLL_180
+            "SIM_IMU_ORIENT": 8,
+            "SIM_IMU_COUNT": 3,
+            "EK3_IMU_MASK": 7,
+            "EK3_PRIMARY": 2,
+        })
+        self.reboot_sitl()
+        self.wait_ekf_happy(require_absolute=False)
+
+        dfreader = self.dfreader_for_current_onboard_log()
+        max_tilt = 10  # degrees; the vehicle is sitting level on the ground
+        ekf_active_us = None
+        first_att_us = None
+        while True:
+            m = dfreader.recv_match(type=['ATT', 'AHR2', 'MSG'])
+            if m is None:
+                break
+            mtype = m.get_type()
+            if mtype == 'MSG':
+                if ekf_active_us is None and "AHRS: EKF3 active" in m.Message:
+                    ekf_active_us = m.TimeUS
+                continue
+            if mtype == 'ATT':
+                if first_att_us is None:
+                    first_att_us = m.TimeUS
+                fields = ['Roll', 'Pitch', 'DesRoll', 'DesPitch']
+            else:
+                # DCM attitude
+                fields = ['Roll', 'Pitch']
+            for field in fields:
+                value = getattr(m, field)
+                if abs(value) > max_tilt:
+                    raise NotAchievedException(
+                        f"{mtype}.{field}={value:.1f} at {m.TimeUS*1e-6:.2f}s; vehicle is level")
+
+        if ekf_active_us is None:
+            raise NotAchievedException("Did not find AHRS switch to EKF3 in log")
+        if first_att_us is None or first_att_us > ekf_active_us:
+            raise NotAchievedException("No attitude logged before the AHRS switched to EKF3")
+
     def AHRSOriginRecorded(self):
         """Test AHRS option to record and reuse origin"""
         self.context_push()
@@ -24912,6 +25203,7 @@ return update, 1000
             self.FarOrigin,
             self.GuidedForceArm,
             self.AHRSOriginRecorded,
+            self.InvertedBoardBootAttitudeTarget,
             self.ScriptingOSD,
             self.ScriptingOSDDisplayPortReplies,
             self.ScriptingOSDDrawScreen,
@@ -24991,6 +25283,8 @@ return update, 1000
             self.FenceFloorAutoEnableOnArming,
             self.AutoTuneSwitch,
             self.GPSFixTypes,
+            self.UBloxNoSaveEveryBoot,
+            self.UBloxNavSolInSavedConfig,
             self.AirModeLanding,
             self.TestLocalHomePosition,
             self.TestGripperMission,
