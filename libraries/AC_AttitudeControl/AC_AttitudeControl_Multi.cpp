@@ -449,10 +449,14 @@ void AC_AttitudeControl_Multi::update_throttle_rpy_mix(float dt)
     _throttle_rpy_mix = constrain_float(_throttle_rpy_mix, 0.1f, AC_ATTITUDE_CONTROL_MAX);
 }
 
-void AC_AttitudeControl_Multi::rate_controller_run_dt(const Vector3f& gyro_rads, float dt)
+// Run the body-frame rate PIDs for one step of dt seconds and set the motor roll, pitch and
+// yaw outputs. ang_vel_body_rads is the rate target in rad/s, passed in rather than read
+// from _ang_vel_body_rads so the fast rate thread can supply its interpolated copy; the
+// sysid rate offset is added to it here. gyro_rads is the measured body rate in rad/s.
+void AC_AttitudeControl_Multi::rate_controller_run_dt(const Vector3f& gyro_rads, float dt, const Vector3f& ang_vel_body_rads)
 {
     // take a copy of the target so that it can't be changed from under us.
-    Vector3f ang_vel_body = _ang_vel_body_rads;
+    Vector3f ang_vel_body = ang_vel_body_rads;
 
     // boost pd on high throttle slew. Applied to a copy as this may run several times per main loop
     const float pd_boost = get_throttle_pd_boost();
@@ -464,6 +468,7 @@ void AC_AttitudeControl_Multi::rate_controller_run_dt(const Vector3f& gyro_rads,
 
     ang_vel_body += _rate_modifiers.sysid_ang_vel_body_rads;
 
+    _rate_target_rads = ang_vel_body;
     _rate_gyro_rads = gyro_rads;
     _rate_gyro_time_us = AP_HAL::micros64();
 
@@ -505,7 +510,7 @@ void AC_AttitudeControl_Multi::rate_controller_run()
 {
     record_rate_modifiers();
     Vector3f gyro_latest_rads = _ahrs.get_gyro_latest();
-    rate_controller_run_dt(gyro_latest_rads, _dt_s);
+    rate_controller_run_dt(gyro_latest_rads, _dt_s, _ang_vel_body_rads);
 }
 
 // sanity check parameters.  should be called once before takeoff

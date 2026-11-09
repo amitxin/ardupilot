@@ -20628,6 +20628,39 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
 
         self.progress("Sprayer OK")
 
+    def ArmedInvertedTakeoff(self):
+        '''check raising the throttle on a vehicle armed upside down rights it without an internal error'''
+        self.context_collect('STATUSTEXT')
+
+        # turn the simulated vehicle upside down on the ground.  The AHRS
+        # must use the simulated attitude, and SIM_GND_BEHAV of 0 stops the
+        # simulator levelling a multicopter on the ground
+        self.install_test_script_context("sim_set_roll.lua")
+        self.set_parameters({
+            "SCR_ENABLE": 1,
+            "AHRS_EKF_TYPE": 10,
+            "EK3_ENABLE": 0,
+            "SIM_GND_BEHAV": 0,
+        })
+        self.reboot_sitl()
+        self.delay_sim_time(10, reason="AHRS to start")
+        self.set_parameter("SCR_USER1", 180)
+        self.wait_roll(180, 20, timeout=30)
+        self.delay_sim_time(5, reason="vehicle to settle")
+        self.change_mode('STABILIZE')
+
+        # the arming checks would refuse an upside-down vehicle
+        self.arm_vehicle(force=True)
+        self.wait_roll(180, 45, timeout=2)
+        self.set_rc(3, 1500)
+        self.wait_roll(0, 20, timeout=20)
+        self.set_rc(3, 1000)
+        if self.armed():
+            self.disarm_vehicle(force=True)
+
+        if self.statustext_in_collections("Internal Errors"):
+            raise NotAchievedException("Internal error raised while armed inverted")
+
     def tests1a(self):
         '''return list of all tests'''
         ret = super(AutoTestCopter, self).tests()  # about 5 mins and ~20 initial tests from autotest/vehicle_test_suite.py
@@ -20860,6 +20893,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             self.Clamp,
             self.ScriptingFlyVelocity,
             self.PLDNoParameters,
+            self.ArmedInvertedTakeoff,
         ])
         return ret
 
@@ -23296,6 +23330,66 @@ RTL_ALT_M 111
         self.assert_parameter_value("RTL_ALT_M", 750)
         self.assert_parameter_value("DISARM_DELAY", 20)
 
+    def SerialPassthru(self):
+        '''smoke test serial passthrough timeout and manual disable'''
+        # SITL does not enforce UART thread ownership, so this cannot
+        # reproduce the ChibiOS ownership failure.
+        self.context_collect('STATUSTEXT')
+
+        # test timeout recovery
+        self.set_parameters({
+            "SERIAL_PASSTIMO": 2,
+            "SERIAL_PASS1": 0,
+            "SERIAL_PASS2": 2,
+        })
+        self.wait_statustext("Passthru enabled", check_context=True, timeout=10, wallclock_timeout=True)
+        self.wait_statustext("Passthru timed out", check_context=True, timeout=15, wallclock_timeout=True)
+        # Verify MAVLink on port 0 responds after passthrough timeout
+        self.assert_parameter_value("MAV_SYSID", 1)
+
+        # Keep SERIAL0 available to disable passthrough after the ports lock.
+        self.set_parameters({"SERIAL1_PROTOCOL": -1, "SERIAL2_PROTOCOL": -1})
+        port1 = self.spare_network_port()
+        port2 = self.spare_network_port(1)
+        self.customise_SITL_commandline([
+            "--serial1=tcp:%u" % port1,
+            "--serial2=tcp:%u" % port2,
+        ])
+        self.context_clear_collection('STATUSTEXT')
+        self.set_parameters({
+            "SERIAL_PASSTIMO": 0,
+            "SERIAL_PASS1": 2,
+            "SERIAL_PASS2": 1,
+        })
+        self.wait_statustext("Passthru enabled", check_context=True, timeout=10, wallclock_timeout=True)
+        self.delay_sim_time(2, reason="wait for passthrough ports to lock")
+        with socket.create_connection(("127.0.0.1", port1), timeout=5) as serial1, \
+                socket.create_connection(("127.0.0.1", port2), timeout=5) as serial2:
+            for source, destination, data in ((serial1, serial2, b"serial1 to serial2"),
+                                              (serial2, serial1, b"serial2 to serial1")):
+                source.sendall(data)
+                received = b''
+                while len(received) < len(data):
+                    chunk = destination.recv(len(data) - len(received))
+                    if not chunk:
+                        raise NotAchievedException("Passthrough socket closed")
+                    received += chunk
+                if received != data:
+                    raise NotAchievedException("Passthrough data differs: %s" % received)
+            self.set_parameter("SERIAL_PASS2", -1)
+            self.wait_statustext("Passthru disabled", check_context=True, timeout=10, wallclock_timeout=True)
+            self.delay_sim_time(1, reason="wait for passthrough forwarding to stop")
+            for source, destination in ((serial1, serial2), (serial2, serial1)):
+                destination.settimeout(0.5)
+                source.sendall(b"after disable")
+                try:
+                    received = destination.recv(1)
+                except socket.timeout:
+                    continue
+                if received:
+                    raise NotAchievedException("Passthrough still forwards after disable")
+        self.assert_parameter_value("MAV_SYSID", 1)
+
     def ScriptingFlipMode(self):
         '''test adding custom mode from scripting'''
         # Really it would be nice to check for the AVAILABLE_MODES message, but pymavlink does not understand them yet.
@@ -25233,6 +25327,7 @@ return update, 1000
             self.LoweheiserManual,
             self.Weathervane,
             self.ReadOnlyDefaults,
+            self.SerialPassthru,
             self.FenceRelativeToOriginMaxAlt,
             self.FenceRelativeToOriginMinAlt,
             self.mission_NAV_LOITER_TURNS_direction,
