@@ -159,7 +159,7 @@ define BOARD_CHECK_F427_USE_1M "ERROR: 1M flash use fmuv2"
 
 
 # short board name override (13 chars) to match original max length; can't change because name is used for transmitter bind CRC
-define CHIBIOS_SHORT_BOARD_NAME "skyviper-v245"
+define HAL_SHORT_BOARD_NAME "skyviper-v245"
 
 # enable AP_Radio support
 define AP_RADIO_ENABLED 1
@@ -339,7 +339,7 @@ define AP_LTM_TELEM_ENABLED 0
 define HAL_BUTTON_ENABLED 0
 
 // disable scripting on SkyViper (should we enable this?)
-define AP_SCRIPTING_ENABLED 0
+define AP_SCRIPTING_LUA_ENABLED 0
 
 // SkyViper does not have a second battery....
 define AP_BATT_MONITOR_MAX_INSTANCES 1

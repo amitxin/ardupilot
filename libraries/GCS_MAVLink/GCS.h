@@ -1329,7 +1329,7 @@ public:
     uint32_t sysid_this_mav() const { return sysid; }
     uint32_t telem_delay() const { return mav_telem_delay; }
 
-#if AP_SCRIPTING_ENABLED
+#if AP_EXTERNAL_BINDING_ENABLED
     // lua access to command_int
     MAV_RESULT lua_command_int_packet(const mavlink_command_int_t &packet);
 #endif
@@ -1418,14 +1418,21 @@ private:
         uint32_t orig_baud2;
         uint8_t orig_parity1;
         uint8_t orig_parity2;
-        uint8_t parity1;
-        uint8_t parity2;
+        uint16_t options1;
+        uint16_t options2;
+        uint16_t start_options1;
+        uint16_t start_options2;
+        uint8_t stop_bits1;
+        uint8_t stop_bits2;
+        // the ports have been taken and set up, see passthru_timer()
+        bool ports_set_up;
         uint8_t timeout_s;
         HAL_Semaphore sem;
     } _passthru;
 
     // timer called to implement pass-thru
     void passthru_timer();
+    void restore_passthru_line_settings();
 
     // this contains the index of the GCS_MAVLINK backend we will
     // first call update_send on.  It is incremented each time

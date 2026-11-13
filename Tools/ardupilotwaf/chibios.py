@@ -398,7 +398,7 @@ class generate_apj(Task.Task):
 class build_abin(Task.Task):
     '''build an abin file for skyviper firmware upload via web UI'''
     color='CYAN'
-    run_str='${TOOLS_SCRIPTS}/make_abin.sh ${SRC} ${TGT}'
+    run_str='${TOOLS_SCRIPTS}/make_abin.sh ${SRC[0].abspath()} ${TGT} ${ABIN_GIT_HASH}'
     def keyword(self):
         return "Generating"
     def __str__(self):
@@ -488,6 +488,9 @@ def chibios_firmware(self):
     self.create_task('generate_apj', src=[intf_bin] + extf_bin, tgt=apj_target)
 
     if self.env.BUILD_ABIN:
+        # the build directory may be outside the source tree, so the
+        # hash is found here rather than by the script
+        self.env.ABIN_GIT_HASH = self.bld.git_head_hash()
         abin_target = self.bld.bldnode.find_or_declare('bin/' + link_output.change_ext('.abin').name)
         abin_task = self.create_task('build_abin', src=[intf_bin] + extf_bin, tgt=abin_target)
         abin_task.dep_nodes.append(self.bld.srcnode.find_node('Tools/scripts/make_abin.sh'))
@@ -750,7 +753,7 @@ def build(bld):
     # runs pass again and both write include_dirs, so a variable only one of
     # them has changes that file after waf has hashed it; ENABLE_CRASHDUMP,
     # which adds AP_HAL to the include path, did exactly that
-    make_vars = "BUILDDIR='${BUILDDIR_REL}' BUILDROOT='${BUILDROOT}' CHIBIOS='${CH_ROOT_REL}' AP_HAL=${AP_HAL_REL} ${CHIBIOS_BUILD_FLAGS} ${CHIBIOS_BOARD_NAME} ${HAL_MAX_STACK_FRAME_SIZE}"
+    make_vars = "BUILDDIR='${BUILDDIR_REL}' BUILDROOT='${BUILDROOT}' CHIBIOS='${CH_ROOT_REL}' AP_HAL=${AP_HAL_REL} ${CHIBIOS_BUILD_FLAGS} ${HAL_MAX_STACK_FRAME_SIZE}"
     if bld.env.ENABLE_CRASHDUMP:
         make_vars += " ENABLE_CRASHDUMP=yes"
 

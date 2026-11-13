@@ -245,6 +245,8 @@ public:
 
     // returns the inertial navigation origin in lat/lon/alt
     bool get_origin(Location &ret) const WARN_IF_UNUSED;
+    // returns true if the global navigation origin is valid
+    bool has_origin() const WARN_IF_UNUSED { return state.origin_ok; }
 
     bool have_inertial_nav() const;
 
@@ -593,11 +595,8 @@ public:
         return _home;
     }
 
-    // functions to handle locking of home.  Some vehicles use this to
-    // allow GCS to lock in a home location.
-    void lock_home() {
-        _home_locked = true;
-    }
+    // true if home has been locked by passing lock to set_home().
+    // Some vehicles use this to allow GCS to lock in a home location.
     bool home_is_locked() const {
         return _home_locked;
     }
@@ -610,19 +609,19 @@ public:
     // set the home location in 10e7 degrees. This should be called
     // when the vehicle is at this position. It is assumed that the
     // current barometer and GPS altitudes correspond to this altitude
-    bool set_home(const Location &loc) WARN_IF_UNUSED;
+    bool set_home(const Location &loc, bool lock=false) WARN_IF_UNUSED;
 
     /*
      * Attitude-related public methods and attributes:
      */
 
-#if AP_SCRIPTING_ENABLED
+#if AP_EXTERNAL_BINDING_ENABLED
     // deprecated functions for accessing rpy.  Do not use, these will
     // be removed.
     float get_roll() const { return roll; }
     float get_pitch() const { return pitch; }
     float get_yaw() const { return yaw; }
-#endif  // AP_SCRIPTING_ENABLED
+#endif  // AP_EXTERNAL_BINDING_ENABLED
 
     // roll/pitch/yaw euler angles, all in radians
     float get_roll_rad() const { return roll; }
@@ -697,9 +696,7 @@ public:
     Vector3f get_vibration(void) const;
 
     // return primary accels
-    const Vector3f &get_accel(void) const {
-        return AP::ins().get_accel(get_primary_accel_index());
-    }
+    const Vector3f &get_accel(void) const;
 
     // return primary accel bias. This should be subtracted from
     // get_accel() vector to get best current body frame accel

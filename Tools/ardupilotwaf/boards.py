@@ -41,6 +41,11 @@ def build_option_defines(options):
     values = {opt.define: build_option_value(options, opt) for opt in build_options.BUILD_OPTIONS}
     return {d: v for d, v in values.items() if v is not None}
 
+def add_optimisation(env, level):
+    '''use the same optimisation level for C and C++'''
+    env.CFLAGS += [level]
+    env.CXXFLAGS += [level]
+
 class BoardMeta(type):
     def __init__(cls, name, bases, dct):
         super(BoardMeta, cls).__init__(name, bases, dct)
@@ -120,11 +125,11 @@ class Board:
 
         if cfg.options.enable_scripting:
             env.DEFINES.update(
-                AP_SCRIPTING_ENABLED = 1,
+                AP_SCRIPTING_LUA_ENABLED = 1,
             )
         elif cfg.options.disable_scripting:
             env.DEFINES.update(
-                AP_SCRIPTING_ENABLED = 0,
+                AP_SCRIPTING_LUA_ENABLED = 0,
             )
 
         # embed any scripts from ROMFS/scripts
@@ -940,9 +945,7 @@ class SITLBoard(Board):
             ]
 
         if not cfg.env.DEBUG:
-            env.CXXFLAGS += [
-                '-O3',
-            ]
+            add_optimisation(env, '-O3')
 
         if cfg.options.asan:
             if not cfg.env.DEBUG:
@@ -1162,6 +1165,8 @@ class esp32(Board):
             'AP_HAL_ESP32',
         ]
 
+        add_optimisation(env, '-Os')
+
         env.CFLAGS += [
             '-fno-inline-functions',
             '-mlongcalls',
@@ -1170,7 +1175,6 @@ class esp32(Board):
         env.CFLAGS.remove('-Werror=undef')
 
         env.CXXFLAGS += ['-mlongcalls',
-                         '-Os',
                          '-g',
                          '-ffunction-sections',
                          '-fdata-sections',
@@ -1251,7 +1255,6 @@ class chibios(Board):
         ]
 
         # make board name available for USB IDs
-        env.CHIBIOS_BOARD_NAME = 'HAL_BOARD_NAME="%s"' % self.name
         env.HAL_MAX_STACK_FRAME_SIZE = 'HAL_MAX_STACK_FRAME_SIZE=%d' % 1300 # set per Wframe-larger-than, ensure its same
         env.CFLAGS += cfg.env.CPU_FLAGS + [
             '-Wlogical-op',
@@ -1513,9 +1516,7 @@ class LinuxBoard(Board):
         )
 
         if not cfg.env.DEBUG:
-            env.CXXFLAGS += [
-                '-O3',
-            ]
+            add_optimisation(env, '-O3')
 
         env.LIB += [
             'm',
@@ -1523,7 +1524,6 @@ class LinuxBoard(Board):
 
         cfg.check_librt(env)
         cfg.check_lttng(env)
-        cfg.check_libdl(env)
         cfg.check_libiio(env)
 
         env.LINKFLAGS += ['-pthread',]
@@ -1679,9 +1679,7 @@ class QURTBoard(Board):
             env.LINKFLAGS += ["-no-threads"]
 
         if not cfg.env.DEBUG:
-            env.CXXFLAGS += [
-                '-O3',
-            ]
+            add_optimisation(env, '-O3')
 
         env.AP_LIBRARIES += [
             'AP_HAL_QURT',

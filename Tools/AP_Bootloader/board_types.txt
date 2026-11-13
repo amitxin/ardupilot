@@ -375,6 +375,9 @@ AP_HW_KT_FMU_F1                      1250
 # IDs 1251-1260 reserved for Simplifly
 AP_HW_SIMPLIFLY_NEO                  1251
 
+AP_HW_LEVIA_H7                       1268
+
+
 AP_HW_GPILOT_P1						 1275
 
 AP_HW_MicoAir743v3                   1299
@@ -500,6 +503,10 @@ AP_HW_INDIH743                       2513
 AP_HW_SakuraRC-H743                  2714
 
 AP_HW_SkyRukh_Surge_H7               2815
+
+# IDs 2850-2859 reserved for BlueBerry
+AP_HW_BlueBerryH743                  2850
+
 # IDs 3136-3145 reserved for MADpilot
 AP_HW_MADPILOT_H7                    3141
 
@@ -664,6 +671,9 @@ AP_HW_PILOTIX                          6120
 AP_HW_Saolah743                      6130
 
 # IDs 6600-6699 reserved for Eagle Eye Drones
+
+# IDs 6700-6709 reserved for Avian Automata
+AP_HW_AVIANAUTOMATA_305AP            6700
 
 # IDs 6900-6909 reserved for Easy Aerial
 

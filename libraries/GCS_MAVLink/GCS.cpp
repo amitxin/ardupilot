@@ -20,6 +20,7 @@
 #include <RC_Channel/RC_Channel.h>
 #include <AP_Vehicle/AP_Vehicle_Type.h>
 #include <AP_Vehicle/AP_Vehicle_config.h>
+#include <AP_InertialSensor/AP_InertialSensor.h>
 
 #include "MissionItemProtocol_Waypoints.h"
 #include "MissionItemProtocol_Rally.h"
@@ -718,7 +719,7 @@ bool GCS_MAVLINK::check_payload_size(uint16_t max_payload_len)
     return true;
 }
 
-#if AP_SCRIPTING_ENABLED
+#if AP_EXTERNAL_BINDING_ENABLED
 /*
   lua access to command_int
 
@@ -737,7 +738,7 @@ MAV_RESULT GCS::lua_command_int_packet(const mavlink_command_int_t &packet)
 
     return ch->handle_command_int_packet(packet, msg);
 }
-#endif // AP_SCRIPTING_ENABLED
+#endif // AP_EXTERNAL_BINDING_ENABLED
 
 /*
   return true if a MAVLink system ID is a GCS for this vehicle

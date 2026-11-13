@@ -519,11 +519,8 @@ void GCS_MAVLINK_Plane::packetReceived(const mavlink_status_t &status,
 
 bool Plane::set_home_to_current_location(bool _lock)
 {
-    if (!set_home_persistently(AP::gps().location())) {
+    if (!set_home_persistently(AP::gps().location(), _lock)) {
         return false;
-    }
-    if (_lock) {
-        AP::ahrs().lock_home();
     }
     if ((control_mode == &mode_rtl)
 #if HAL_QUADPLANE_ENABLED
@@ -537,11 +534,8 @@ bool Plane::set_home_to_current_location(bool _lock)
 }
 bool Plane::set_home(const Location& loc, bool _lock)
 {
-    if (!AP::ahrs().set_home(loc)) {
+    if (!ahrs.set_home(loc, _lock)) {
         return false;
-    }
-    if (_lock) {
-        AP::ahrs().lock_home();
     }
     if ((control_mode == &mode_rtl)
 #if HAL_QUADPLANE_ENABLED

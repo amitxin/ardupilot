@@ -6721,6 +6721,74 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
                      timeout=1,
                      want_result=mavutil.mavlink.MAV_RESULT_DENIED)
 
+    def MAV_CMD_DO_SET_MISSION_CURRENT_no_nav_command(self):
+        '''Test setting the current command in a mission whose loop holds no nav command'''
+
+        # setting the current command searches forward for a nav command to
+        # load, following jumps as it goes.  A forever jump over nothing but
+        # do commands never runs out of repeats and never reaches a nav
+        # command, so the search has nothing to terminate on and locks up the
+        # main loop, taking the vehicle with it.
+        # The mission is meant to fly back and forth between two waypoints
+        # but the jump mistakenly targets the DO_SET_ROI_NONE instead of the
+        # first waypoint, and the RTL after it can never be reached
+        self.upload_simple_relhome_mission([
+            (mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 20),                                    # 1
+            (mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 20, 0, 20),                                  # 2
+            (mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 40, 0, 20),                                  # 3
+            self.create_MISSION_ITEM_INT(mavutil.mavlink.MAV_CMD_DO_SET_ROI_NONE),              # 4
+            self.create_MISSION_ITEM_INT(mavutil.mavlink.MAV_CMD_DO_JUMP, p1=4, p2=-1),         # 5 jump to 4 forever
+            (mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH, 0, 0, 0),                            # 6
+        ])
+
+        # the vehicle must answer.  A missing ack here means it never came back
+        # from the search, not that it declined the command
+        self.run_cmd(
+            mavutil.mavlink.MAV_CMD_DO_SET_MISSION_CURRENT,
+            p1=4,
+            timeout=10,
+            want_result=mavutil.mavlink.MAV_RESULT_FAILED,
+        )
+
+        # and must still be talking to us afterwards
+        self.wait_heartbeat()
+        self.wait_heartbeat()
+
+    def MissionUnstartableNavCommandLoop(self):
+        '''Test a mission ends when its jump loop holds only a nav command the vehicle cannot start'''
+
+        # the vehicle skips a nav command it cannot start and carries on to
+        # the next command.  The mission is meant to fly back and forth
+        # between two waypoints but the jump mistakenly targets a plane-only
+        # command that Copter cannot start, so every pass of the search skips
+        # it and follows the jump back to it.  The search must give up and
+        # end the mission rather than start again on every update
+        self.upload_simple_relhome_mission([
+            (mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 20),                                     # 1
+            (mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 20, 0, 20),                                   # 2
+            (mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 40, 0, 20),                                   # 3
+            (mavutil.mavlink.MAV_CMD_NAV_CONTINUE_AND_CHANGE_ALT, 0, 0, 30),                     # 4 plane only
+            self.create_MISSION_ITEM_INT(mavutil.mavlink.MAV_CMD_DO_JUMP, p1=4, p2=-1),          # 5 jump to 4 forever
+            (mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH, 0, 0, 0),                             # 6
+        ])
+
+        self.set_parameter("AUTO_OPTIONS", 3)
+        self.change_mode('AUTO')
+        self.wait_ready_to_arm()
+        self.arm_vehicle()
+        self.wait_waypoint(3, 3)
+
+        self.progress("Waiting for the mission to complete")
+        tstart = self.get_sim_time()
+        while True:
+            if self.get_sim_time() - tstart > 60:
+                raise NotAchievedException("Mission did not complete")
+            m = self.assert_receive_message('MISSION_CURRENT')
+            if m.mission_state == mavutil.mavlink.MISSION_STATE_COMPLETE:
+                break
+
+        self.do_RTL()
+
     def InvalidJumpTags(self):
         '''Verify the behaviour when selecting invalid jump tags.'''
 
@@ -6736,6 +6804,112 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
                      p1=MAX_TAG_NUM+1,
                      timeout=1,
                      want_result=mavutil.mavlink.MAV_RESULT_DENIED)
+
+    def fly_jump_loop_mission(self, name, items, loop_end_wp, loop_centre):
+        '''fly items and check the vehicle keeps to the loop the jump creates
+
+        items must jump back forever over a leg centred on loop_centre.
+        loop_end_wp is the sequence number of the last waypoint of that leg,
+        reached just before the jump is taken.
+        '''
+        self.progress("Jump case: %s" % name)
+        self.start_flying_simple_relhome_mission(items)
+
+        # reach the end of the looped leg for the first time
+        self.wait_current_waypoint(loop_end_wp, timeout=120)
+
+        # the jump goes back to the start of the leg, so the vehicle should
+        # orbit it.  Position is checked rather than the reported current
+        # waypoint, which advances correctly even when the lookahead does not
+        tstart = self.get_sim_time()
+        while self.get_sim_time() - tstart < 45:
+            dist = self.get_distance(loop_centre, self.get_location())
+            if dist > 100:
+                raise NotAchievedException(
+                    "%s: vehicle left the loop after the jump, %.0fm from its centre" % (name, dist))
+            self.delay_sim_time(1, "checking the vehicle stays on the loop")
+
+        self.progress("%s: stayed on the loop" % name)
+        self.do_RTL()
+
+    def JumpNextNavCmd(self):
+        '''Verify Copter flies the loop that a DO_JUMP or DO_JUMP_TAG creates'''
+
+        # when flying to a waypoint Copter also looks at the nav command that
+        # follows it, to shape the path through the corner.  That look-ahead
+        # must find the same command the mission goes on to fly.  Each case
+        # below jumps forever back over the wpA <-> wpB leg, so the vehicle
+        # must stay near that leg.  The waypoints 300m south of it are only
+        # reached if the jump is ignored.  The cases are DO_JUMP and
+        # DO_JUMP_TAG, each landing on a nav command or a do command
+        alt = 20
+        loop_centre = self.offset_location_ne(self.home_position_as_location(), 7, 22)
+
+        takeoff_and_approach = [
+            (mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, alt),
+            (mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 19, -57, alt),
+            (mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 35, -17, alt),
+        ]
+        wpA = (mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 23, 14, alt)
+        wpB = (mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, -8, 30, alt)
+        beyond_the_jump = [
+            (mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, -300, 30, alt),
+            (mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, -350, 30, alt),
+        ]
+        # a do command that Copter's AUTO handles and that needs no hardware
+        roi_none = mavutil.mavlink.MAV_CMD_DO_SET_ROI_NONE
+
+        # the target is a do command, so the scan has to carry on past it to
+        # reach wpA.  This is the general form of the bug, tags aside
+        self.fly_jump_loop_mission(
+            "jump to do command",
+            takeoff_and_approach + [
+                self.create_MISSION_ITEM_INT(roi_none),                                      # 4 jump target
+                wpA,                                                                         # 5
+                wpB,                                                                         # 6
+                self.create_MISSION_ITEM_INT(mavutil.mavlink.MAV_CMD_DO_JUMP, p1=4, p2=-1),  # 7
+            ] + beyond_the_jump,
+            loop_end_wp=6,
+            loop_centre=loop_centre)
+
+        # the target is a nav command, which the scan returns immediately.
+        # This shape always worked, and is here to keep it that way
+        self.fly_jump_loop_mission(
+            "jump to nav command",
+            takeoff_and_approach + [
+                wpA,                                                                         # 4 jump target
+                wpB,                                                                         # 5
+                self.create_MISSION_ITEM_INT(mavutil.mavlink.MAV_CMD_DO_JUMP, p1=4, p2=-1),  # 6
+            ] + beyond_the_jump,
+            loop_end_wp=5,
+            loop_centre=loop_centre)
+
+        # a tag jump always lands on the tag marker, which is never a nav
+        # command, so this shape was broken for every mission that used tags
+        self.fly_jump_loop_mission(
+            "jump tag to nav command",
+            takeoff_and_approach + [
+                self.create_MISSION_ITEM_INT(mavutil.mavlink.MAV_CMD_JUMP_TAG, p1=1),            # 4 tag 1
+                wpA,                                                                             # 5
+                wpB,                                                                             # 6
+                self.create_MISSION_ITEM_INT(mavutil.mavlink.MAV_CMD_DO_JUMP_TAG, p1=1, p2=-1),  # 7
+            ] + beyond_the_jump,
+            loop_end_wp=6,
+            loop_centre=loop_centre)
+
+        # tag marker then a do command: the scan has to step over two non-nav
+        # commands before it reaches wpA
+        self.fly_jump_loop_mission(
+            "jump tag to do command",
+            takeoff_and_approach + [
+                self.create_MISSION_ITEM_INT(mavutil.mavlink.MAV_CMD_JUMP_TAG, p1=2),            # 4 tag 2
+                self.create_MISSION_ITEM_INT(roi_none),                                          # 5
+                wpA,                                                                             # 6
+                wpB,                                                                             # 7
+                self.create_MISSION_ITEM_INT(mavutil.mavlink.MAV_CMD_DO_JUMP_TAG, p1=2, p2=-1),  # 8
+            ] + beyond_the_jump,
+            loop_end_wp=7,
+            loop_centre=loop_centre)
 
     def GPSViconSwitching(self):
         """Fly GPS and Vicon switching test"""
@@ -20950,6 +21124,8 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             self.CircleManualControlEntryRight,
             self.CirclePilotRadiusZero,
             self.MissionIndexValidity,
+            self.MAV_CMD_DO_SET_MISSION_CURRENT_no_nav_command,
+            self.MissionUnstartableNavCommandLoop,
             self.RPLidarA2,
             self.MAV_CMD_NAV_TAKEOFF_no_location,
             self.DualTuningChannels,
@@ -23663,6 +23839,33 @@ return update()
             raise NotAchievedException("arm bit still set after disarming")
         msp.callback = None
 
+    def OSDFirstBackendFails(self):
+        '''check the second OSD runs, and arming is allowed, when the first one does not start'''
+        self.context_collect('STATUSTEXT')
+        # MSP DisplayPort with no serial port set up for it fails to start,
+        # and MSP always starts
+        self.set_parameters({
+            "OSD_TYPE": 5,
+            "OSD_TYPE2": 3,
+        })
+        self.reboot_sitl()
+        self.wait_statustext("MSP DisplayPort uart not available", check_context=True)
+        self.wait_ready_to_arm()
+
+        # TXONLY never creates a backend
+        self.set_parameter("OSD_TYPE", 4)
+        self.reboot_sitl()
+        self.wait_ready_to_arm()
+
+        # a second OSD refused as incompatible with the first still fails pre-arm
+        self.set_parameters({
+            "OSD_TYPE": 3,
+            "OSD_TYPE2": 5,
+        })
+        self.reboot_sitl()
+        self.assert_prearm_failure("OSD_TYPE2 not compatible with first OSD",
+                                   other_prearm_failures_fatal=False)
+
     def RTLYaw(self):
         '''test that vehicle yaws to original heading on RTL'''
         # the vehicle's heading is whatever the previous test left it
@@ -25286,6 +25489,7 @@ return update, 1000
             self.CameraServoZoomFocusSpeed,
             self.FlyMissionTwice,
             self.FlyMissionTwiceWithReset,
+            self.JumpNextNavCmd,
             self.BrakeZ,
             self.COMMAND_LONG_positional_command_int_only,
             self.LoiterToGuidedHomeVSOrigin,
@@ -25299,6 +25503,7 @@ return update, 1000
             self.ScriptingOSD,
             self.ScriptingOSDDisplayPortReplies,
             self.ScriptingOSDDrawScreen,
+            self.OSDFirstBackendFails,
             self.TestEKF3CompassFailover,
             self.EKF3SRCPerCore,
         ])
@@ -25336,6 +25541,7 @@ return update, 1000
             Test(self.GyroFFTHarmonic, attempts=4, speedup=8),
             Test(self.GyroFFTAverage, attempts=1, speedup=8),
             self.CRSF,
+            self.SerialPassthroughRCIN,
             self.GSF,
             self.SIMCompare,
             self.WatchAlts,
