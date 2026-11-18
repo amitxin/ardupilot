@@ -109,8 +109,9 @@ public:
     // get_height_override() - returns the user-specified height of sensor above ground
     float get_height_override() const { return _height_override; }
 
-    // get_alt_min() - returns the altitude above terrain below which the sensor cannot focus
-    float get_alt_min() const { return constrain_float(_alt_min, 0, 5); }
+    // get_height_min() - returns the height below which the sensor cannot focus.
+    // bounded well above any real sensor, as a mis-set value discards the flow at every height
+    float get_height_min() const { return constrain_float(_height_min, 0, 5); }
 
     struct OpticalFlow_state {
         uint8_t  surface_quality;   // image quality (below TBD you can't trust the dx,dy values returned)
@@ -148,7 +149,7 @@ private:
     AP_Vector3f _pos_offset;        // position offset of the flow sensor in the body frame
     AP_Int8  _address;              // address on the bus (allows selecting between 8 possible I2C addresses for px4flow)
     AP_Float  _height_override;              // height of the sensor above the ground. Only used in rover
-    AP_Float  _alt_min;              // altitude above terrain below which the sensor cannot focus
+    AP_Float  _height_min;                   // height below which the sensor cannot focus on the ground
     AP_UInt16 _options;              // options parameter
 
     // method called by backend to update frontend state:

@@ -17,6 +17,9 @@ void NavEKF3_core::controlFilterModes()
     if (motorsArmed && !prevMotorsArmed) {
         // set the time at which we arm to assist with checks
         timeAtArming_ms =  imuSampleTime_ms;
+    } else if (!motorsArmed && prevMotorsArmed) {
+        // a rest reading only holds for the flight it was taken before
+        flowFocusRestRng = 0;
     }
 
     // Detect if we are in flight on or ground
@@ -446,6 +449,7 @@ void NavEKF3_core::setAidingMode()
             // this reduces the time required for the baro noise filter to settle before the filtered baro data can be used
             meaHgtAtTakeOff = baroDataDelayed.hgt;
             // reset the vertical position state to faster recover from baro errors experienced during touchdown
+            flowFocusRngPosD += -meaHgtAtTakeOff - stateStruct.position.z;
             stateStruct.position.z = -meaHgtAtTakeOff;
             // store the current height to be used to keep reporting
             // the last known position
@@ -575,9 +579,10 @@ bool NavEKF3_core::readyToUseOptFlow(void) const
         return false;
     }
 
-    // flow that is not fused because the sensor is below its focus altitude cannot aid. Without this a vehicle
-    // held below that altitude leaves relative aiding on the flow timeout and re-enters it on the next sample
-    if (flowRngBelowAltMin) {
+    // flow the focus height check is discarding cannot aid, and without this a vehicle held below
+    // its floor leaves AID_RELATIVE on the timeout and re-enters on the next sample, every 5 s.
+    // At rest on the ground it fuses zero flow instead, which can aid
+    if (flowFocusBelow && !flowFocusResting) {
         return false;
     }
 

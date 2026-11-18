@@ -1636,13 +1636,13 @@ bool NavEKF3::configuredToUseGPSForPos(void) const
 // heightOverride is the fixed height of the sensor above ground in m, when on rover vehicles. 0 if not used
 // altMin is the altitude above terrain in m below which the sensor cannot focus. 0 if not used
 #if EK3_FEATURE_OPTFLOW_FUSION
-void NavEKF3::writeOptFlowMeas(const uint8_t rawFlowQuality, const Vector2f &rawFlowRates, const Vector2f &rawGyroRates, const uint32_t msecFlowMeas, const Vector3f &posOffset, float heightOverride, float altMin)
+void NavEKF3::writeOptFlowMeas(const uint8_t rawFlowQuality, const Vector2f &rawFlowRates, const Vector2f &rawGyroRates, const uint32_t msecFlowMeas, const Vector3f &posOffset, float heightOverride, float minHeight)
 {
-    dal.writeOptFlowMeas(rawFlowQuality, rawFlowRates, rawGyroRates, msecFlowMeas, posOffset, heightOverride, altMin);
+    dal.writeOptFlowMeas(rawFlowQuality, rawFlowRates, rawGyroRates, msecFlowMeas, posOffset, heightOverride, minHeight);
 
     if (core) {
         for (uint8_t i=0; i<num_cores; i++) {
-            core[i].writeOptFlowMeas(rawFlowQuality, rawFlowRates, rawGyroRates, msecFlowMeas, posOffset, heightOverride, altMin);
+            core[i].writeOptFlowMeas(rawFlowQuality, rawFlowRates, rawGyroRates, msecFlowMeas, posOffset, heightOverride, minHeight);
         }
     }
 }

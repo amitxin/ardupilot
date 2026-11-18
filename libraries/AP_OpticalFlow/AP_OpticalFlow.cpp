@@ -105,14 +105,14 @@ const AP_Param::GroupInfo AP_OpticalFlow::var_info[] = {
     // @User: Standard
     AP_GROUPINFO("_OPTIONS", 7,  AP_OpticalFlow, _options,   0),
 
-    // @Param: _ALT_MIN
-    // @DisplayName: Optical flow minimum focus altitude
-    // @Description: Altitude above terrain below which this sensor cannot focus so its output is not motion. When the altitude above terrain estimate is below this the EKF3 does not fuse the flow measurements. Set this to the sensor's focus limit and no higher because a vehicle held below this altitude in flight will lose optical flow aiding. 0 disables the check. Ignored on the ground before takeoff, by EKF2 and by Rover when FLOW_HGT_OVR is set. Not used when flow is used for terrain estimation (EK3_FLOW_USE=2).
+    // @Param: _HGT_MIN
+    // @DisplayName: Optical flow minimum focus height
+    // @Description: Height above ground below which this sensor cannot focus, so its output is not motion. In flight below this height EKF3 discards the flow rather than dead reckoning a phantom velocity from it. Once the rangefinder stops reporting below its own minimum, EKF3 keeps discarding the flow while the rangefinder reports out of range low, and otherwise for up to 5s using the height change since its last reading. Some rangefinder drivers report a lost return as out of range high, which does not keep it on past the 5s. The check uses the rangefinder height at the vehicle origin, so a large FLOW_POS offset biases it. EKF3 also discards flow within 0.05 of the rangefinder ground clearance, the larger of RNGFNDx_GNDCLR and 0.05, whatever this is set to, so only a value above that has any effect. Set this to the sensor's focus limit and no higher: with no flow to fuse, a vehicle held below it in flight for more than 5s loses flow aiding and reverts to constant position mode. On the ground, where the rangefinder reads its ground clearance or out of range low, or within 0.05 of what it read on the ground before takeoff, EKF3 fuses zero flow instead and keeps flow aiding, so this suits a vehicle that is still on the ground, not one that drives or rolls there. The reading before takeoff is taken while the sensor reports flow, and assumes the rangefinder reads no more than 0.05 further at landing than before that flight's takeoff. 0 leaves only the ground clearance check. Rover uses neither this nor the ground clearance check, as it drives at the rangefinder ground clearance.
     // @Range: 0 5
     // @Increment: 0.01
     // @Units: m
     // @User: Advanced
-    AP_GROUPINFO("_ALT_MIN", 8, AP_OpticalFlow, _alt_min, 0.0f),
+    AP_GROUPINFO("_HGT_MIN", 8, AP_OpticalFlow, _height_min, 0.0f),
 
     AP_GROUPEND
 };
@@ -287,7 +287,7 @@ void AP_OpticalFlow::update_state(const OpticalFlow_state &state)
                                 _last_update_ms,
                                 get_pos_offset(),
                                 get_height_override(),
-                                get_alt_min());
+                                get_height_min());
 #endif
 #if HAL_LOGGING_ENABLED
     Log_Write_Optflow();
