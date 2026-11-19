@@ -1566,16 +1566,16 @@ class AutoTestPlane(vehicle_test_suite.TestSuite):
         self.set_heartbeat_rate(self.speedup)
         self.end_subtest("Completed RTL Failsafe test")
 
-        self.start_subtest("Test Failsafe: FBWA Glide")
+        self.start_subtest("Test Failsafe: Glide")
         self.set_parameters({
             "FS_LONG_ACTN": 2,
         })
         self.change_mode('AUTO')
         self.progress("Disconnecting GCS")
         self.set_heartbeat_rate(0)
-        self.wait_mode("FBWA", timeout=10)
+        self.wait_mode(27, timeout=10)  # Glide, need pymavlink support to use text name
         self.set_heartbeat_rate(self.speedup)
-        self.end_subtest("Completed FBWA Failsafe test")
+        self.end_subtest("Completed Glide Failsafe test")
 
         self.start_subtest("Test Failsafe: Deploy Parachute")
         self.load_mission("plane-parachute-mission.txt")
@@ -1589,6 +1589,74 @@ class AutoTestPlane(vehicle_test_suite.TestSuite):
         self.disarm_vehicle(force=True)
         self.reboot_sitl()
         self.end_subtest("Completed Parachute Failsafe test")
+
+    def GlideFailsafeThrottle(self):
+        '''Ensure throttle is forced to zero in the glide failsafe and pilot authority returns on recovery'''
+        self.set_parameters({
+            "FS_SHORT_ACTN": 2,  # short failsafe action: glide
+            "FS_LONG_ACTN": 2,   # long failsafe action: glide, so we stay in the glide
+            "THR_MIN": 20,       # non-zero so a zeroed throttle is distinct from throttle min
+        })
+        self.takeoff(50, mode='TAKEOFF')
+        # TAKEOFF takes no short failsafe action, CRUISE does and holds altitude on auto throttle
+        self.change_mode('CRUISE')
+        self.context_collect('STATUSTEXT')
+        self.progress("Failing receiver to trigger glide failsafe")
+        self.set_parameter("SIM_RC_FAIL", 1)  # no pulses
+        self.wait_statustext("RC Short Failsafe: switched to Glide", check_context=True)
+        self.wait_mode(27)  # Glide, need pymavlink support to use text name
+        self.drain_mav()  # make sure we have the latest throttle output
+        # throttle must be forced to zero (SERVO3_MIN), not held at THR_MIN
+        self.assert_servo_channel_value(3, self.get_parameter("SERVO3_MIN"))
+
+        self.progress("Waiting for long failsafe, we should stay in the glide")
+        self.wait_statustext("RC Long Failsafe On", check_context=True)
+        self.assert_mode(27)
+
+        self.progress("Restoring receiver, long failsafe does not restore the mode")
+        self.set_parameter("SIM_RC_FAIL", 0)
+        self.wait_statustext("RC Long Failsafe Cleared", check_context=True)
+        self.assert_mode(27)
+
+        self.progress("Pilot must be able to leave the glide and regain throttle")
+        self.change_mode("FBWA")
+        self.set_rc(3, 1800)
+        self.wait_servo_channel_value(3, 1500, comparator=operator.ge, timeout=5)
+        self.set_rc(3, 1500)
+        self.fly_home_land_and_disarm()
+
+    def GlideFailsafeThrottleReverse(self):
+        '''Ensure reverse thrust goes to zero, not full reverse, in the glide failsafe'''
+        # the reverse thrust sim model interprets throttle as an angle
+        # output: 1000 = full reverse, 1500 = zero thrust, 2000 = full forward
+        self.customise_SITL_commandline([], model="plane-revthrust", wipe=True)
+        self.set_parameters({
+            "THR_MIN": -100,      # negative THR_MIN enables reverse thrust
+            "SERVO3_MIN": 1000,
+            "SERVO3_TRIM": 1500,  # zero-thrust point for a reversible ESC
+            "SERVO3_MAX": 2000,
+            "FS_SHORT_ACTN": 2,   # short failsafe action: glide
+            "FS_LONG_ACTN": 2,    # long failsafe action: glide, so we stay in the glide
+        })
+        # take off in TAKEOFF mode: auto throttle avoids the reverse-thrust
+        # stick mapping and never commands reverse during the climb
+        self.takeoff(50, mode='TAKEOFF')
+        # TAKEOFF takes no short failsafe action, CRUISE does and holds altitude on auto throttle
+        self.change_mode('CRUISE')
+        self.context_collect('STATUSTEXT')
+        self.progress("Failing receiver to trigger glide failsafe")
+        self.set_parameter("SIM_RC_FAIL", 1)  # no pulses
+        self.wait_statustext("RC Short Failsafe: switched to Glide", check_context=True)
+        self.wait_mode(27)  # Glide, need pymavlink support to use text name
+        self.drain_mav()  # make sure we have the latest throttle output
+
+        def within_10(got, want):
+            return abs(got - want) <= 10
+
+        # zero thrust is SERVO3_TRIM (1500); the FBWA glide drove full reverse (SERVO3_MIN, 1000)
+        self.assert_servo_channel_value(3, self.get_parameter("SERVO3_TRIM"), comparator=within_10)
+        self.set_parameter("SIM_RC_FAIL", 0)
+        self.fly_home_land_and_disarm()
 
     def TestGripperMission(self):
         '''Test Gripper mission items'''
@@ -6838,11 +6906,12 @@ return update()
 
         self.fly_home_land_and_disarm()
 
-    def TakeoffGround(self):
-        '''Test a rolling TAKEOFF.'''
+    def takeoff_ground(self, gnd_pitch):
+        '''Do a rolling TAKEOFF with the given TKOFF_GND_PITCH.'''
 
         self.set_parameters({
             "TKOFF_ROTATE_SPD": 15.0,
+            "TKOFF_GND_PITCH": gnd_pitch,
             "TKOFF_PLIM_SEC": 0,  # Ensure TKOFF_PLIM_SEC doesn't interfere with the test.
             "TKOFF_DIST": 500,  # Ensure stall prevention doesn't interfere with the test.
             "TKOFF_ALT": 100  # Ditto
@@ -6856,8 +6925,9 @@ return update()
         self.wait_groundspeed(8, 10)
         m = self.assert_receive_message('NAV_CONTROLLER_OUTPUT', timeout=5)
         nav_pitch = m.nav_pitch
-        if nav_pitch > 5.1 or nav_pitch < 4.9:
+        if abs(nav_pitch - gnd_pitch) > 0.1:
             raise NotAchievedException(f"Did not achieve correct takeoff pitch ({nav_pitch}).")
+        ground_roll_time = self.get_sim_time()
 
         # Check whether we've achieved correct target pitch after rotation.
         self.wait_groundspeed(24, 25)
@@ -6867,6 +6937,33 @@ return update()
             raise NotAchievedException(f"Did not achieve correct takeoff pitch ({nav_pitch}).")
 
         self.fly_home_land_and_disarm()
+
+        # Check that the TECS pitch limits were the ground pitch in the
+        # last second before the ground roll check.
+        dfreader = self.dfreader_for_current_onboard_log()
+        count = 0
+        while True:
+            m = dfreader.recv_match(type='TECS')
+            if m is None:
+                break
+            t = m.TimeUS * 1e-6
+            if t < ground_roll_time - 1 or t > ground_roll_time:
+                continue
+            count += 1
+            for (name, value) in (("pmin", m.pmin), ("pmax", m.pmax)):
+                if abs(math.degrees(value) - gnd_pitch) > 0.1:
+                    raise NotAchievedException(
+                        f"TECS {name} is {math.degrees(value):.2f} deg, want {gnd_pitch}")
+        if count == 0:
+            raise NotAchievedException("No TECS messages in the ground roll")
+
+    def TakeoffGround(self):
+        '''Test a rolling TAKEOFF.'''
+        self.takeoff_ground(5)
+
+    def TakeoffGroundNegativePitch(self):
+        '''Test a rolling TAKEOFF with a negative ground pitch.'''
+        self.takeoff_ground(-2)
 
     def TakeoffIdleThrottle(self):
         '''Apply idle throttle before takeoff.'''
@@ -9975,6 +10072,7 @@ return update()
             16: "Initialising",
             24: "Thermal",
             26: "Autoland",
+            27: "Glide",
         }
         initialising = self.get_mode_from_mode_mapping("INITIALISING")
         modes = self.assert_available_modes(expected_modes, not_user_selectable=[initialising])
@@ -9985,8 +10083,9 @@ return update()
         self.start_subtest("modes blocked by FLTMODE_GCSBLOCK are not user-selectable")
         circle = self.get_mode_from_mode_mapping("CIRCLE")
         guided = self.get_mode_from_mode_mapping("GUIDED")
-        self.set_parameter("FLTMODE_GCSBLOCK", (1 << 1) | (1 << 13))  # CIRCLE and GUIDED
-        self.assert_available_modes(expected_modes, not_user_selectable=[initialising, circle, guided])
+        glide = 27  # Glide, need pymavlink support to use text name
+        self.set_parameter("FLTMODE_GCSBLOCK", (1 << 1) | (1 << 13) | (1 << 22))  # CIRCLE, GUIDED and Glide
+        self.assert_available_modes(expected_modes, not_user_selectable=[initialising, circle, guided, glide])
         self.set_parameter("FLTMODE_GCSBLOCK", 0)
 
         self.start_subtest("request the first and last modes by index")
@@ -11005,6 +11104,7 @@ return update()
             self.TakeoffAuto4,
             self.TakeoffTakeoff1,
             self.TakeoffGround,
+            self.TakeoffGroundNegativePitch,
             self.MAVFTP,
             self.MAVFTPListDirectoryFullPacket,
             self.MAVFTPMavLogDirectory,
@@ -11031,6 +11131,8 @@ return update()
             self.MissionJumpTags,
             self.JumpBestLandSequence,
             Test(self.GCSFailsafe, speedup=8),
+            self.GlideFailsafeThrottle,
+            self.GlideFailsafeThrottleReverse,
             self.RudderArmedTakeoffRequiresNeutralThrottle,
             self.MAV_CMD_DO_AUTOTUNE_ENABLE,
             self.MAV_CMD_NAV_ALTITUDE_WAIT,

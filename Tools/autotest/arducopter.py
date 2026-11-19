@@ -1944,6 +1944,46 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.set_parameter('SIM_BATT_VOLTAGE', 12.5)
         self.clear_battery_failsafe()
 
+    def BatteryFailsafeTwoStageBrakeLandRTL(self):
+        '''Two stage battery failsafe: low Brake/Land then critical RTL'''
+        self.batt_failsafe_init()
+        self.takeoffAndMoveAway()
+        self.set_parameters({
+            'BATT_FS_LOW_ACT': 7,
+            'BATT_FS_CRT_ACT': 2,
+            'SIM_BATT_VOLTAGE': 11.4,
+        })
+        self.wait_statustext("Battery 1 is low", timeout=60)
+        self.wait_mode("BRAKE")
+        self.set_parameter('SIM_BATT_VOLTAGE', 10.0)
+        self.wait_statustext("Battery 1 is critical", timeout=60)
+        self.wait_mode("RTL")
+        self.wait_landed_and_disarmed()
+
+    def BatteryFailsafeTwoStageSmartRTLDoLandStart(self):
+        '''Two stage battery failsafe: low SmartRTL then critical Auto DO_LAND_START'''
+        self.batt_failsafe_init()
+        self.takeoffAndMoveAway()
+        self.upload_simple_relhome_mission([
+            (mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 0, 100, 50),                   # 1
+            self.create_MISSION_ITEM_INT(mavutil.mavlink.MAV_CMD_DO_LAND_START),  # 2
+            (mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 0, 20, 30),                    # 3
+            (mavutil.mavlink.MAV_CMD_NAV_LAND, 0, 10, 0),                         # 4
+        ])
+        self.set_parameters({
+            'BATT_FS_LOW_ACT': 3,
+            'BATT_FS_CRT_ACT': 6,
+            'SIM_BATT_VOLTAGE': 11.4,
+        })
+        self.wait_statustext("Battery 1 is low", timeout=60)
+        self.wait_mode("SMART_RTL")
+        self.set_parameter('SIM_BATT_VOLTAGE', 10.0)
+        self.wait_statustext("Battery 1 is critical", timeout=60)
+        self.wait_mode("AUTO_RTL")
+        self.wait_current_waypoint(3)
+        self.wait_landed_and_disarmed()
+        self.reboot_sitl()  # landed away from home
+
     def BatteryFailsafeOptionsContinueLanding(self):
         '''Battery failsafe with FS_OPTIONS set to continue landing'''
         # Trigger low battery condition in land mode with FS_OPTIONS
@@ -17171,6 +17211,24 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
 
         self.context_pop()
 
+    def EK3YawAlignEachTakeoff(self):
+        '''EKF3 redoes the in-flight yaw alignment on each takeoff, including after landing while armed'''
+        alignment_text = "EKF3 IMU0 MAG0 in-flight yaw alignment complete"
+        self.context_collect('STATUSTEXT')
+        self.takeoff(altitude_min=10, mode='ALT_HOLD')
+        self.wait_statustext(alignment_text, check_context=True, timeout=10)
+        # a low but not minimum throttle lands the vehicle without disarming it
+        self.set_rc(3, 1300)
+        self.wait_altitude(-1, 0.3, relative=True, timeout=120)
+        self.delay_sim_time(5, reason="let the land detector trigger")
+        # take off again without disarming and expect the alignment again
+        self.context_clear_collection('STATUSTEXT')
+        self.set_rc(3, 1700)
+        self.wait_statustext(alignment_text, check_context=True, timeout=30)
+        self.set_rc(3, 1500)
+        # return home so the vehicle ends the test where it started
+        self.do_RTL()
+
     def EKFYawResetLogged(self):
         '''in-filter EKF yaw resets must propagate through AHRS and be logged'''
         # the emergency yaw reset request is routed by AHRS to the
@@ -21631,6 +21689,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             self.MotorTest,
             self.EKFSource,
             self.AHRSSwitchBackendPositionReset,
+            self.EK3YawAlignEachTakeoff,
             self.EKFYawResetLogged,
             self.RTLYaw,
             self.DataFlash,
@@ -24465,26 +24524,7 @@ return update()
         })
         self.set_parameter("COMPASS_LEARN", 2)  # 2 is Copy-from-EKF
 
-        # commence silly flying to try to give the EKF as much
-        # information as possible for it to converge its estimation;
-        # there's a 5e-6 check before we consider the offsets good!
-        self.set_rc(4, 1450)
-        self.set_rc(1, 1450)
-        for i in range(0, 5):  # we descend through all of this:
-            self.change_mode('LOITER')
-            self.delay_sim_time(10, reason="compass learn data to accumulate")
-            self.change_mode('ALT_HOLD')
-            self.change_mode('FLIP')
-
-        self.set_parameter('ATC_ANGLE_MAX', 70)
-        self.change_mode('ALT_HOLD')
-        for j in 1000, 2000:
-            for i in 1, 2, 4:
-                self.set_rc(i, j)
-                self.delay_sim_time(10, reason="compass learn data to accumulate")
-        self.set_rc(1, 1500)
-        self.set_rc(2, 1500)
-        self.set_rc(4, 1500)
+        self.fly_compass_learning_manoeuvres()
         return new_compass_ofs_x
 
     def CompassLearnDisabledDoesNotSave(self):
@@ -24535,9 +24575,80 @@ return update()
         })
         self.set_parameter("COMPASS_LEARN", 2)  # 2 is Copy-from-EKF
 
-        # commence silly flying to try to give the EKF as much
-        # information as possible for it to converge its estimation;
-        # there's a 5e-6 check before we consider the offsets good!
+        self.fly_compass_learning_manoeuvres()
+
+        self.do_RTL()
+        # both compasses should have been learned and saved on that disarm:
+        expected_offsets = {
+            "COMPASS_OFS_X": new_compass_ofs_x,
+            "COMPASS_OFS2_X": new_compass2_ofs_x,
+        }
+        self.assert_parameter_values(expected_offsets, epsilon=30)
+        self.assert_EV_count(EKF_MAG_OFFSETS_SAVED, 1)
+        self.reboot_sitl()
+        self.assert_parameter_values(expected_offsets, epsilon=30)
+
+    def CompassLearnAffinityFailRecover(self):
+        '''check EKF-learned offsets are saved to the right compass after a compass fails and recovers'''
+        # with EK3 compass affinity the core pinned to compass 1 moves to
+        # compass 2 when compass 1 fails and returns to compass 1 when it
+        # recovers.  The offsets saved at disarm must still belong to the
+        # compass they were learned for.
+        self.set_parameters({
+            "EK3_AFFINITY": 4,  # 4 is EnableCompassAffinity
+            "EK3_IMU_MASK": 3,  # two IMUs, so two cores, so two compasses
+        })
+        self.reboot_sitl()
+
+        self.wait_ready_to_arm()
+        self.takeoff(30, mode='ALT_HOLD')
+        self.set_parameter('COMPASS_USE3', 0)
+        # the firmware is about to learn and save these, so set them to
+        # the values they already have; that way the suite knows what to
+        # restore them to at context pop time.  set_and_save_offsets()
+        # writes all three axes, not just the one we assert on:
+        self.set_parameters(self.get_parameters([
+            "COMPASS_OFS_X", "COMPASS_OFS_Y", "COMPASS_OFS_Z",
+            "COMPASS_OFS2_X", "COMPASS_OFS2_Y", "COMPASS_OFS2_Z",
+            "COMPASS_OFS3_X", "COMPASS_OFS3_Y", "COMPASS_OFS3_Z",
+        ]))
+        original_compass_ofs_x = self.get_parameter("COMPASS_OFS_X")
+        new_compass_ofs_x = 200
+        new_compass2_ofs_x = -150
+        self.set_parameters({
+            "SIM_MAG1_OFS_X": new_compass_ofs_x,
+            "SIM_MAG2_OFS_X": new_compass2_ofs_x,
+        })
+        self.set_parameter("COMPASS_LEARN", 2)  # 2 is Copy-from-EKF
+
+        self.fly_compass_learning_manoeuvres()
+
+        # fail compass 1; the core using it switches to compass 2 and
+        # has to learn compass 2's field from scratch
+        self.set_parameter("SIM_MAG1_FAIL", 1)
+        self.wait_statustext("EKF3 IMU0 switching to compass 1", timeout=60)
+        self.fly_compass_learning_manoeuvres()
+
+        # compass 1 recovers and affinity returns the core to it
+        self.context_collect('STATUSTEXT')
+        self.set_parameter("SIM_MAG1_FAIL", 0)
+        self.wait_statustext("EKF3 IMU0 switching to compass 0", check_context=True, timeout=60)
+        self.delay_sim_time(15, reason="compass 1 to be used again")
+
+        self.do_RTL()
+        # compass 2's offsets were learned and must be saved to compass 2
+        self.assert_parameter_value("COMPASS_OFS2_X", new_compass2_ofs_x, epsilon=30)
+        # compass 1 has had little time to relearn since it recovered, so
+        # its offsets are either unchanged or correct, but must never be
+        # compass 2's offsets
+        ofs_x = self.get_parameter("COMPASS_OFS_X")
+        if abs(ofs_x - original_compass_ofs_x) > 30 and abs(ofs_x - new_compass_ofs_x) > 30:
+            raise NotAchievedException(
+                "COMPASS_OFS_X=%f is neither the original (%f) nor the learned (%f) offset" %
+                (ofs_x, original_compass_ofs_x, new_compass_ofs_x))
+
+    def fly_compass_learning_manoeuvres(self):
+        '''commence silly flying to give the EKF as much information as possible to converge its compass offset estimates'''
         self.set_rc(4, 1450)
         self.set_rc(1, 1450)
         for i in range(0, 5):  # we descend through all of this:
@@ -24555,17 +24666,6 @@ return update()
         self.set_rc(1, 1500)
         self.set_rc(2, 1500)
         self.set_rc(4, 1500)
-
-        self.do_RTL()
-        # both compasses should have been learned and saved on that disarm:
-        expected_offsets = {
-            "COMPASS_OFS_X": new_compass_ofs_x,
-            "COMPASS_OFS2_X": new_compass2_ofs_x,
-        }
-        self.assert_parameter_values(expected_offsets, epsilon=30)
-        self.assert_EV_count(EKF_MAG_OFFSETS_SAVED, 1)
-        self.reboot_sitl()
-        self.assert_parameter_values(expected_offsets, epsilon=30)
 
     def CompassLearnCopyFromSIM(self):
         '''test COMPASS_LEARN=2 saves the ideal offsets from the SIM AHRS backend'''
@@ -25982,6 +26082,8 @@ return update, 1000
             self.WPArcs,
             self.BatteryFailsafeTwoStage,
             self.BatteryFailsafeBrakeLand,
+            self.BatteryFailsafeTwoStageBrakeLandRTL,
+            self.BatteryFailsafeTwoStageSmartRTLDoLandStart,
             self.MinAltFenceAvoid,
             self.FenceFloorEnabledLanding,
             self.FenceUpload_MissionItem,
@@ -26166,6 +26268,7 @@ return update, 1000
             self.RC_OPTIONS_1_FS_THR_ENABLE_0,
             self.CompassLearnCopyFromEKFAffinity,
             self.CompassLearnDisabledDoesNotSave,
+            self.CompassLearnAffinityFailRecover,
             self.AHRSAutoTrim,
             self.AHRSTrim,
             self.PeriphMultiUARTTunnel,
