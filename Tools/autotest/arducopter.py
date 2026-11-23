@@ -5250,6 +5250,43 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
 
         self.disarm_vehicle(force=True)
 
+    def LoiterCoordinatedTurn(self):
+        '''Loiter coordinated turns do not surge after releasing pitch and yaw'''
+        self.set_parameters({
+            "LOIT_OPTIONS": 1,
+        })
+        self.takeoff(20, mode='LOITER')
+
+        self.set_rc_from_map({
+            2: 1000,
+            4: 2000,
+        })
+        self.delay_sim_time(10, reason="turn at full pitch and full yaw")
+        release_loc = self.get_location()
+        release_speed = self.assert_receive_message('VFR_HUD').groundspeed
+        self.set_rc_from_map({
+            2: 1500,
+            4: 1500,
+        })
+        max_speed = release_speed
+        tstart = self.get_sim_time()
+        while True:
+            if self.get_sim_time_cached() - tstart > 30:
+                raise NotAchievedException("did not stop")
+            speed = self.assert_receive_message('VFR_HUD').groundspeed
+            max_speed = max(max_speed, speed)
+            if speed < 0.2:
+                break
+        stop_dist = self.get_distance(release_loc, self.get_location())
+        self.progress("release speed %.2f m/s, peak after release %.2f m/s, stopped %.1f m from release" %
+                      (release_speed, max_speed, stop_dist))
+        if max_speed > release_speed + 0.5:
+            raise NotAchievedException("speed rose to %.2f m/s after release at %.2f m/s" % (max_speed, release_speed))
+        if stop_dist > 4:
+            raise NotAchievedException("stopped %.1f m from release, want under 4" % stop_dist)
+
+        self.do_RTL()
+
     def ModeFlowHold(self):
         '''test FlowHold mode - position hold and flow-based height estimation'''
         self.set_parameters({
@@ -8755,6 +8792,46 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.wait_text("Abort: Gripper Open", timeout=90)
 
         self.wait_disarmed()
+
+    def PayloadPlaceManualReleaseDelay(self):
+        '''check PLDP_DELAY is honoured after a manual release early in the descent'''
+        self.set_analog_rangefinder_parameters()
+        self.set_servo_gripper_parameters()
+        self.set_parameters({
+            "PLDP_DELAY": 5,
+            # slow the descent ramp so the release happens before the descent speed is reached
+            "PLDP_SPEED_DN": 1.5,
+            "WP_ACC_Z": 0.5,
+        })
+        self.reboot_sitl()
+
+        self.context_collect('STATUSTEXT')
+        self.run_auxfunc(19, 2)
+        self.wait_statustext("Gripper load grabbed", check_context=True)
+
+        num_wp = self.load_and_start_mission("copter_payload_place.txt")
+        self.wait_current_waypoint(3, timeout=120)
+        self.wait_climbrate(-5, -0.2, minimum_duration=0.2, timeout=60)
+
+        self.progress("Releasing the gripper early in the descent")
+        self.run_auxfunc(19, 0)
+        self.wait_statustext("PayloadPlace: Manual release", check_context=True)
+        # the defect only shows before the descent reaches 95% of PLDP_SPEED_DN (1.5 m/s)
+        climb = self.assert_receive_message('VFR_HUD').climb
+        if climb < -1.2:
+            raise NotAchievedException("Released too late in the descent (climb=%f)" % climb)
+        release_alt = self.get_altitude(relative=True)
+        tstart = self.get_sim_time()
+        while self.get_sim_time_cached() - tstart < 4:
+            alt = self.get_altitude(relative=True)
+            if alt > release_alt + 0.5:
+                raise NotAchievedException("Climbed before PLDP_DELAY expired (alt=%f release_alt=%f)" %
+                                           (alt, release_alt))
+
+        self.progress("Waiting for the ascent once PLDP_DELAY expires")
+        self.wait_altitude(release_alt + 0.5, 22, relative=True, timeout=60)
+        self.wait_waypoint(num_wp-1, num_wp-1)
+        self.do_RTL()
 
     def Weathervane(self):
         '''Test copter weathervaning'''
@@ -14955,6 +15032,109 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
 
         self.context_pop()
         self.do_RTL()
+
+    def send_jittered_follow_samples(self, msg_type):
+        '''send a target moving north at 20 m/s at 2 Hz, each sample keeping
+        its sample timestamp but delivered 20 to 425 ms late, followed by a
+        30 m jump east.  Returns the sim time window the samples were sent in
+        and the number of steady samples'''
+        vel_n = 20  # m/s
+        sample_interval = 0.5
+        delays = [0.020, 0.425, 0.220, 0.060, 0.380, 0.140, 0.300, 0.020]
+        num_steady = 24
+        jump_e = 30
+
+        start_loc = self.get_location()
+        self.location_offset_ne(start_loc, 50, 0)
+        alt_abs_m = start_loc.get_alt_m(AltFrame.ABSOLUTE)
+        origin = self.poll_message('GPS_GLOBAL_ORIGIN')
+
+        self.assert_receive_message('SYSTEM_TIME')
+        t0 = self.get_sim_time_cached() + 1
+        samples = []
+        for k in range(num_steady + 2):
+            sample_time = t0 + k * sample_interval
+            loc = copy.copy(start_loc)
+            self.location_offset_ne(loc, vel_n * (sample_time - t0), jump_e if k >= num_steady else 0)
+            samples.append((sample_time + delays[k % len(delays)], sample_time, loc))
+
+        for (send_time, sample_time, loc) in samples:
+            while self.get_sim_time_cached() < send_time:
+                self.assert_receive_message('SYSTEM_TIME')
+            if msg_type == 'GLOBAL_POSITION_INT':
+                self.mav.mav.global_position_int_send(
+                    int(sample_time * 1000),  # time_boot_ms
+                    int(loc.lat * 1e7),
+                    int(loc.lng * 1e7),
+                    int(alt_abs_m * 1000),  # alt in mm
+                    int(alt_abs_m * 1000 - origin.altitude),  # relative alt in mm
+                    int(vel_n * 100),  # vx in cm/s
+                    0,
+                    0,
+                    0  # hdg
+                )
+            else:
+                self.mav.mav.follow_target_send(
+                    int(sample_time * 1000),  # timestamp in ms
+                    1 << 0 | 1 << 1,  # pos, vel
+                    int(loc.lat * 1e7),
+                    int(loc.lng * 1e7),
+                    alt_abs_m,  # alt in m
+                    [vel_n, 0, 0],  # velocity m/s
+                    [0, 0, 0],  # acceleration m/s/s
+                    [1, 0, 0, 0],  # attitude quaternion
+                    [0, 0, 0],  # rates
+                    [0, 0, 0],  # covariances
+                    0  # custom state
+                )
+        return (samples[0][0] - 0.25, samples[-1][0] + 0.25, num_steady)
+
+    def ModeFollow_TimestampJitter(self):
+        '''check target timestamp jitter does not reset the follow estimate'''
+        self.set_parameters({
+            "FOLL_ENABLE": 1,
+            "FOLL_SYSID": self.mav.source_system,
+            "FOLL_TIMEOUT": 2,
+            "FOLL_ACCEL_NE": 5,
+            "FOLL_DIST_MAX": 0,  # the target travels well beyond the default 100 m
+        })
+        self.takeoff(10, mode="LOITER")
+        self.context_push()
+        self.context_set_speedup(1)
+        self.set_message_rate_hz('SYSTEM_TIME', 50)
+
+        windows = {}
+        for msg_type in 'GLOBAL_POSITION_INT', 'FOLLOW_TARGET':
+            self.start_subtest("Jittered %s" % msg_type)
+            windows[msg_type] = self.send_jittered_follow_samples(msg_type)
+
+        self.context_pop()
+        self.do_RTL()
+
+        # FOLL is written on each target update straight after the reset check,
+        # and its estimated location is zero when the estimate has just been reset
+        dfreader = self.dfreader_for_current_onboard_log()
+        rows = []
+        while True:
+            m = dfreader.recv_match(type='FOLL')
+            if m is None:
+                break
+            rows.append(m)
+
+        for (msg_type, (tstart, tend, num_steady)) in windows.items():
+            valid = [m.LatE != 0 for m in rows if tstart * 1e6 <= m.TimeUS <= tend * 1e6]
+            self.progress("%s FOLL estimate valid: %s" % (msg_type, str(valid)))
+            if len(valid) != num_steady + 2:
+                raise NotAchievedException("%s: expected %u FOLL rows, got %u" % (msg_type, num_steady + 2, len(valid)))
+            # the first sample builds the estimate, so its row is skipped
+            resets = valid[1:num_steady].count(False)
+            if resets != 0:
+                raise NotAchievedException("%s: estimate reset on %u of %u steady samples" %
+                                           (msg_type, resets, num_steady - 1))
+            if valid[num_steady]:
+                raise NotAchievedException("%s: estimate not reset by the 30 m jump" % msg_type)
+            if not valid[num_steady + 1]:
+                raise NotAchievedException("%s: estimate not valid on the update after the jump" % msg_type)
 
     def ModeFollow_with_FOLLOW_TARGET(self):
         '''test ModeFollow passing in FOLLOW_TARGET messages'''
@@ -21586,6 +21766,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             self.AutoYawDO_MOUNT_CONTROL,
             self.ParameterChecks,
             self.ModeFollow_with_FOLLOW_TARGET,
+            self.ModeFollow_TimestampJitter,
             self.MAVLinkRangeFinderIDs,
             self.MAV_CMD_NAV_LOITER_UNLIM,
             self.FenceRelativePreArms,
@@ -26101,6 +26282,7 @@ return update, 1000
             self.SimpleMode,
             self.LandRepositionSpeed,
             self.LoiterFlowBrakeOvershoot,
+            self.LoiterCoordinatedTurn,
             self.Gripper,
             self.BaseLoggingRates,
             self.GPSViconSwitching,
@@ -26173,6 +26355,7 @@ return update, 1000
         ret = ([
             self.GuidedSubModeChange,
             self.PayloadPlaceMission,
+            self.PayloadPlaceManualReleaseDelay,
             self.TerrainFailsafe,
             self.BatteryFailsafeTerminate,
             self.GainBackoffTakeoff,
