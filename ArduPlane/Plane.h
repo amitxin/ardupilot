@@ -125,6 +125,9 @@
 #if AP_ADSB_AVOIDANCE_ENABLED
 #include "avoidance_adsb.h"
 #endif  // AP_ADSB_AVOIDANCE_ENABLED
+// included unconditionally so AP_OA_SCRIPTING_ENABLED is always defined (the
+// header self-guards); the oascripting member below is gated on that macro.
+#include <AC_Avoidance/AP_OAScripting.h>
 #include "AP_Arming_Plane.h"
 #include "pullup.h"
 #include "systemid.h"
@@ -303,6 +306,10 @@ private:
 #if OSD_ENABLED || OSD_PARAM_ENABLED
     AP_OSD osd;
 #endif
+
+#if AP_OA_SCRIPTING_ENABLED
+    AP_OAScripting oascripting;
+#endif // AP_OA_SCRIPTING_ENABLED
 
     ModeCircle mode_circle;
     ModeStabilize mode_stabilize;
@@ -561,7 +568,7 @@ private:
         // last home altitude for detecting changes
         int32_t last_home_alt_cm;
 
-        // have we finished the takeoff ratation (when it applies)?
+        // have we finished the takeoff rotation (when it applies)?
         bool rotation_complete;
     } auto_state;
 
@@ -1033,7 +1040,7 @@ private:
 
     bool is_land_command(uint16_t cmd) const;
 
-    bool do_change_speed(SPEED_TYPE speedtype, float speed_target_ms, float rhtottle_pct);
+    bool do_change_speed(SPEED_TYPE speedtype, float speed_target_ms, float throttle_pct);
     /*
       return true if in a specific AUTO mission command
     */
@@ -1346,6 +1353,12 @@ public:
     // allow scripts to override mission/guided crosstrack behaviour
     // It's up to the Lua script to ensure the provided location makes sense
     bool set_crosstrack_start(const Location &new_start_location) override;
+
+    // allow scripts to temporarily disable horizontal crosstrack path-following
+    // without touching prev_WP_loc (and so without disturbing the vertical
+    // glide-slope, which also depends on it)
+    bool set_crosstrack_enabled(bool enabled) override;
+    bool get_crosstrack_enabled(bool &enabled) const override;
 
 #endif // AP_EXTERNAL_BINDING_ENABLED
 

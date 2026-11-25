@@ -26,6 +26,7 @@ import errno
 import json
 import os
 import secrets
+import select
 import shutil
 import signal
 import socket
@@ -47,6 +48,8 @@ import dfu
 import fat_image
 import gen_board
 import renode_data
+
+from process_utils import arm_parent_death_signal
 
 EXT_FLASH_BASE = gen_board.EXT_FLASH_BASE
 SHF_ALLOC = 0x2
@@ -429,7 +432,7 @@ def firmware_format(source):
              '(expected APJ, BIN, HEX, or ELF)' % source)
 
 
-def _decode_apj(source, maximum_size, expected_board_id):
+def _read_apj(source, expected_board_id):
     try:
         descriptor = json.loads(source.read_text())
         if not isinstance(descriptor, dict):
@@ -441,14 +444,22 @@ def _decode_apj(source, maximum_size, expected_board_id):
             raise ValueError(
                 'APJ board ID %u does not match target board ID %u' %
                 (board_id, expected_board_id))
-        compressed = base64.b64decode(descriptor['image'], validate=True)
+        return descriptor
+    except (KeyError, OSError, TypeError, ValueError,
+            binascii.Error, zlib.error) as error:
+        sys.exit('failed to decode firmware %s: %s' % (source, error))
+
+
+def _decode_apj_field(source, descriptor, field, size_field, maximum_size):
+    try:
+        compressed = base64.b64decode(descriptor[field], validate=True)
         decompressor = zlib.decompressobj()
         firmware = decompressor.decompress(compressed, maximum_size + 1)
         if len(firmware) > maximum_size or not decompressor.eof:
             raise ValueError('expanded APJ image exceeds target flash')
         if decompressor.unused_data:
             raise ValueError('APJ image has trailing compressed data')
-        image_size = int(descriptor['image_size'])
+        image_size = int(descriptor[size_field])
         if image_size != len(firmware):
             raise ValueError(
                 'APJ image_size is %u but image contains %u bytes' %
@@ -457,6 +468,24 @@ def _decode_apj(source, maximum_size, expected_board_id):
     except (KeyError, OSError, TypeError, ValueError,
             binascii.Error, zlib.error) as error:
         sys.exit('failed to decode firmware %s: %s' % (source, error))
+
+
+def _decode_apj(source, maximum_size, expected_board_id):
+    descriptor = _read_apj(source, expected_board_id)
+    return _decode_apj_field(
+        source, descriptor, 'image', 'image_size', maximum_size)
+
+
+def make_apj_external_binary(source, destination, maximum_size,
+                             expected_board_id=None):
+    '''Decode an APJ external-flash image, returning None when absent.'''
+    descriptor = _read_apj(Path(source), expected_board_id)
+    if 'extf_image' not in descriptor:
+        return None
+    firmware = _decode_apj_field(
+        source, descriptor, 'extf_image', 'extf_image_size', maximum_size)
+    Path(destination).write_bytes(firmware)
+    return Path(destination)
 
 
 def elf_sections_from(path, address):
@@ -663,7 +692,66 @@ def stop_renode_process(process, timeout=5):
         process.wait()
 
 
-def run_renode(cmd, env, cpusel):
+# Renode stops a failed -e command list but keeps running, so a model that
+# fails to compile would leave a silent, idle emulator. Run the setup
+# commands from the monitor's Python and exit with this code on the first
+# failure instead.
+STARTUP_FAILED = 3
+
+STARTUP_SCRIPT = '''import System
+from Antmicro.Renode.UserInterface import CommandInteractionEater
+commands = [%s]
+interaction = monitor.Interaction
+for command in commands:
+    # nested scripts report errors through monitor.Interaction
+    eater = CommandInteractionEater()
+    monitor.Interaction = eater
+    try:
+        ok = monitor.Parse(command, eater)
+    finally:
+        monitor.Interaction = interaction
+    output = eater.GetContents()
+    for character in output or '':
+        interaction.Write(character)
+    if not ok:
+        System.Console.Error.WriteLine(
+            'Renode startup command failed: %%s\\n%%s' %% (command, eater.GetError()))
+        System.Console.Error.Flush()
+        System.Environment.Exit(%u)
+'''
+
+
+def make_startup_script(path, commands):
+    '''Write a monitor Python script that runs commands and exits on failure.'''
+    # IronPython 2 reads the script as ASCII
+    literals = ', '.join('u' + ascii(command) for command in commands)
+    path.write_text(STARTUP_SCRIPT % (literals, STARTUP_FAILED))
+    return path
+
+
+def output_pipe_disconnected(streams=(sys.stdout, sys.stderr)):
+    '''Return true when a captured output pipe no longer has a reader.'''
+    if not hasattr(select, 'poll'):
+        return False
+    poller = select.poll()
+    registered = False
+    for stream in streams:
+        try:
+            fd = stream.fileno()
+            mode = os.fstat(fd).st_mode
+        except (AttributeError, OSError, ValueError):
+            continue
+        if not stat.S_ISFIFO(mode):
+            continue
+        poller.register(fd, select.POLLERR | select.POLLHUP | select.POLLNVAL)
+        registered = True
+    if not registered:
+        return False
+    failure = select.POLLERR | select.POLLHUP | select.POLLNVAL
+    return any(events & failure for _fd, events in poller.poll(0))
+
+
+def run_renode(cmd, env, cpusel, launcher_pid):
     '''Run Renode, optionally pinning only its emulated CPU thread.'''
     process = None
     # a signal while Popen runs is deferred so the child is always reaped
@@ -679,25 +767,33 @@ def run_renode(cmd, env, cpusel):
         signal.signal(signal.SIGTERM, terminate)
         signal.signal(signal.SIGHUP, terminate)
     pinned = set()
+    # keep our banner ahead of Renode's output when redirected
+    sys.stdout.flush()
     try:
+        run_pid = os.getpid()
         process = subprocess.Popen(
-            cmd, env=env, start_new_session=(os.name == 'posix'))
+            cmd, env=env, start_new_session=(os.name == 'posix'),
+            preexec_fn=(lambda: arm_parent_death_signal(run_pid))
+            if sys.platform.startswith('linux') else None)
         launching = False
         if pending:
             raise SystemExit(128 + pending[0])
-        if cpusel is None:
-            return process.wait()
         while process.poll() is None:
-            live_threads = renode_cpu_threads(process.pid)
-            pinned.intersection_update(live_threads)
-            for thread_id in sorted(live_threads - pinned):
-                try:
-                    os.sched_setaffinity(thread_id, {cpusel})
-                except ProcessLookupError:
-                    continue
-                pinned.add(thread_id)
-                print('pinned Renode emulation thread %u to host CPU %u' %
-                      (thread_id, cpusel))
+            if os.getppid() != launcher_pid:
+                raise SystemExit('Renode launcher parent exited')
+            if output_pipe_disconnected():
+                raise SystemExit('Renode launcher output disconnected')
+            if cpusel is not None:
+                live_threads = renode_cpu_threads(process.pid)
+                pinned.intersection_update(live_threads)
+                for thread_id in sorted(live_threads - pinned):
+                    try:
+                        os.sched_setaffinity(thread_id, {cpusel})
+                    except ProcessLookupError:
+                        continue
+                    pinned.add(thread_id)
+                    print('pinned Renode emulation thread %u to host CPU %u' %
+                          (thread_id, cpusel))
             time.sleep(0.05 if not pinned else 0.5)
         return process.returncode
     except BaseException as error:
@@ -709,6 +805,7 @@ def run_renode(cmd, env, cpusel):
 
 
 def main():
+    launcher_pid = os.getppid()
     root = Path(__file__).resolve().parents[2]
     boards = gen_board.supported_boards(root)
 
@@ -1068,6 +1165,16 @@ def main():
         'sysbus LoadBinary @%s 0x08000000' % flash_img,
         'sysbus LoadBinary @%s 0x%08X' % (mcu_id_bin, generated['uid_address']),
     ]
+    ext_flash_mb = hwdef_value(generated['hwdef_h'], 'EXT_FLASH_SIZE_MB') or 0
+    if image_format == 'apj' and ext_flash_mb:
+        external_bin = make_apj_external_binary(
+            firmware, outdir / 'current-external-firmware.bin',
+            ext_flash_mb << 20,
+            hwdef_value(generated['hwdef_h'], 'APJ_BOARD_ID'))
+        if external_bin is not None:
+            initial_loads.append(
+                'sysbus LoadBinary @%s 0x%08X' %
+                (external_bin, EXT_FLASH_BASE))
     persistent_regions = [
         ('persistentFlash', flash_img, 0x08000000, flash_size),
     ]
@@ -1390,7 +1497,17 @@ def main():
     for attachment in generated['attachments']:
         print('device:  %s on %s' % (
             attachment['device']['name'], attachment['port']['name']))
-    cmd = [renode, '--disable-xwt'] + monitor + ['-e', '; '.join(commands)]
+    # 'start' runs from the -e list: running it from a startup script
+    # deadlocks with the Python peripheral hooks
+    startup = ['include @%s' % make_startup_script(state_dir / 'startup.py', commands)]
+    if 'start' in commands:
+        split = commands.index('start')
+        startup = [
+            'include @%s' % make_startup_script(state_dir / 'startup.py', commands[:split]),
+            'start',
+            'include @%s' % make_startup_script(state_dir / 'post-start.py', commands[split + 1:]),
+        ]
+    cmd = [renode, '--disable-xwt'] + monitor + ['-e', '; '.join(startup)]
     if args.dfu:
         try:
             dfu_device = dfu.DfuDevice(
@@ -1426,7 +1543,7 @@ def main():
                 '--node-id', str(node_id),
             ]))
         try:
-            ret = run_renode(cmd, env, args.cpusel)
+            ret = run_renode(cmd, env, args.cpusel, launcher_pid)
         except KeyboardInterrupt:
             ret = 130
         except OSError as error:

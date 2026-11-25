@@ -8,11 +8,14 @@ import base64
 import importlib.util
 import json
 import os
+import select
 import shutil
+import signal
 import socket
 import struct
 import subprocess
 import sys
+import time
 import zlib
 
 from pathlib import Path
@@ -29,6 +32,101 @@ SPEC.loader.exec_module(renode_run)
 
 APP_BASE = 0x08020000
 FLASH_SIZE = 2 * 1024 * 1024
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'),
+                    reason='requires Linux parent-death signals')
+def test_parent_death_signal_stops_child():
+    child_code = '''
+import os
+import signal
+import sys
+import time
+sys.path.insert(0, sys.argv[1])
+from process_utils import arm_parent_death_signal
+arm_parent_death_signal(os.getppid(), signal.SIGTERM)
+print(os.getpid(), flush=True)
+time.sleep(30)
+'''
+    launcher_code = '''
+import subprocess
+import sys
+child = subprocess.Popen(
+    [sys.executable, '-c', sys.argv[2], sys.argv[1]],
+    stdout=subprocess.PIPE, text=True)
+print(child.stdout.readline().strip(), flush=True)
+'''
+    launcher = subprocess.Popen(
+        [sys.executable, '-c', launcher_code, str(MODULE_PATH.parent),
+         child_code], stdout=subprocess.PIPE, text=True)
+    child_pid = int(launcher.stdout.readline())
+    assert launcher.wait(timeout=5) == 0
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            stat_fields = Path('/proc/%u/stat' % child_pid).read_text().split()
+        except FileNotFoundError:
+            break
+        if stat_fields[2] == 'Z':
+            break
+        time.sleep(0.05)
+    else:
+        os.kill(child_pid, signal.SIGKILL)
+        pytest.fail('child survived its parent')
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'),
+                    reason='requires Linux parent-death signals')
+def test_parent_death_signal_overrides_deferring_handler():
+    # the parent is already gone, as seen by a child whose inherited
+    # handler would otherwise swallow the signal
+    child_code = '''
+import os
+import signal
+import sys
+sys.path.insert(0, sys.argv[1])
+from process_utils import arm_parent_death_signal
+signal.signal(signal.SIGTERM, lambda signum, frame: None)
+arm_parent_death_signal(os.getppid() + 1, signal.SIGTERM)
+'''
+    child = subprocess.run([sys.executable, '-c', child_code, str(MODULE_PATH.parent)],
+                           timeout=10)
+    assert child.returncode == -signal.SIGTERM
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'),
+                    reason='requires Linux parent-death signals')
+def test_parent_death_signal_resets_handler_while_parent_alive():
+    child_code = '''
+import os
+import signal
+import sys
+sys.path.insert(0, sys.argv[1])
+from process_utils import arm_parent_death_signal
+signal.signal(signal.SIGTERM, lambda signum, frame: None)
+arm_parent_death_signal(os.getppid(), signal.SIGTERM)
+sys.exit(0 if signal.getsignal(signal.SIGTERM) == signal.SIG_DFL else 1)
+'''
+    child = subprocess.run([sys.executable, '-c', child_code, str(MODULE_PATH.parent)],
+                           timeout=10)
+    assert child.returncode == 0
+
+
+@pytest.mark.skipif(not hasattr(select, 'poll'),
+                    reason='requires poll support')
+def test_output_pipe_disconnect_detection():
+    read_fd, write_fd = os.pipe()
+    write_stream = os.fdopen(write_fd, 'w')
+    try:
+        assert not renode_run.output_pipe_disconnected((write_stream,))
+        os.close(read_fd)
+        read_fd = None
+        assert renode_run.output_pipe_disconnected((write_stream,))
+    finally:
+        if read_fd is not None:
+            os.close(read_fd)
+        write_stream.close()
 
 
 @pytest.mark.skipif(not hasattr(socket, 'AF_UNIX'),
@@ -168,6 +266,44 @@ def test_convert_and_validate_apj_firmware(tmp_path):
             expected_board_id=43)
 
 
+def test_decode_apj_external_flash(tmp_path):
+    internal = b'internal image'
+    external = b'external image'
+    descriptor = {
+        'magic': 'APJFWv1',
+        'board_id': 42,
+        'image_size': len(internal),
+        'image': base64.b64encode(zlib.compress(internal)).decode('ascii'),
+        'extf_image_size': len(external),
+        'extf_image': base64.b64encode(zlib.compress(external)).decode('ascii'),
+    }
+    source = tmp_path / 'firmware.apj'
+    source.write_text(json.dumps(descriptor))
+    destination = tmp_path / 'current-external-firmware.bin'
+
+    result = renode_run.make_apj_external_binary(
+        source, destination, 1024, expected_board_id=42)
+
+    assert result == destination
+    assert destination.read_bytes() == external
+
+
+def test_apj_without_external_flash_returns_none(tmp_path):
+    payload = b'internal only'
+    descriptor = {
+        'magic': 'APJFWv1',
+        'board_id': 42,
+        'image_size': len(payload),
+        'image': base64.b64encode(zlib.compress(payload)).decode('ascii'),
+    }
+    source = tmp_path / 'firmware.apj'
+    source.write_text(json.dumps(descriptor))
+
+    assert renode_run.make_apj_external_binary(
+        source, tmp_path / 'external.bin', 1024,
+        expected_board_id=42) is None
+
+
 def test_convert_hex_firmware_ignores_bootloader(tmp_path):
     intelhex = pytest.importorskip('intelhex')
     source = tmp_path / 'firmware.hex'
@@ -183,3 +319,46 @@ def test_convert_hex_firmware_ignores_bootloader(tmp_path):
         source, destination, APP_BASE, FLASH_SIZE)
 
     assert destination.read_bytes() == b'\x01\x02\x03'
+
+
+def run_startup_script(tmp_path, commands):
+    executable = Path(os.environ.get(
+        'RENODE', MODULE_PATH.parents[2] / 'build/renode/renode'))
+    if not executable.is_file():
+        pytest.skip('build Renode or set RENODE')
+    script = renode_run.make_startup_script(tmp_path / 'startup.py', commands)
+    return subprocess.run(
+        [str(executable.resolve()), '--disable-xwt', '--console', '--plain',
+         '-e', 'include @%s; quit' % script],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True, timeout=120,
+        env=dict(os.environ, TMPDIR=str(tmp_path),
+                 XDG_CONFIG_HOME=str(tmp_path / 'xdg')))
+
+
+def test_startup_script_quotes_commands(tmp_path):
+    commands = ['$a=@/path with space', 'cpu AddHook 0 "monitor.Parse(\'x\')"',
+                '$b=@/home/j\u00f6rg']
+    script = renode_run.make_startup_script(tmp_path / 'startup.py', commands)
+    assert script.read_bytes().isascii()
+    line = next(line for line in script.read_text().splitlines()
+                if line.startswith('commands = '))
+    assert eval(line.split('=', 1)[1]) == commands
+
+
+def test_startup_script_exits_on_nested_compile_error(tmp_path):
+    model = tmp_path / 'Broken.cs'
+    model.write_text('namespace X { class Broken { int f = "x"; } }\n')
+    nested = tmp_path / 'nested.resc'
+    nested.write_text('include @%s\n' % model)
+    result = run_startup_script(
+        tmp_path, ['include @%s' % nested, 'echo "not reached"'])
+    assert result.returncode == renode_run.STARTUP_FAILED
+    assert 'error CS0029' in result.stdout
+    assert 'not reached' not in result.stdout
+
+
+def test_startup_script_runs_all_commands(tmp_path):
+    result = run_startup_script(tmp_path, ['$x=@/home/j\u00f6rg', 'echo "reached"'])
+    assert result.returncode == 0
+    assert 'reached' in result.stdout

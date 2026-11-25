@@ -1062,6 +1062,64 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.wait_disarmed(timeout=600)
         self.context_pop()
 
+    def WPArcDelay(self):
+        '''test arc waypoints after delays'''
+        self.set_parameters({
+            "AUTO_OPTIONS": 3,
+        })
+
+        pos, radius = self.circle_from_arc((0, 0), (90, 0), 90)
+        loc = self.offset_location_ne(self.home_position_as_location(), pos[0], pos[1])
+
+        def fly_and_check_arc(items):
+            self.change_mode('STABILIZE')  # needed to ensure Copter mission state machine works
+            self.start_flying_simple_relhome_mission(items)
+            self.wait_altitude(19, 21, relative=True)
+            self.wait_groundspeed(1, 10)
+            self.wait_circling_point_with_radius(
+                loc, radius,
+                epsilon=1,
+                min_circle_time=7,
+                timeout=30,
+                track_angle=False,
+            )
+            self.wait_distance_to_home(80, 100)
+            self.wait_disarmed()
+
+        self.start_subtest("WP -> ARC")
+        fly_and_check_arc([
+            (mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 20),
+            (mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 0, 0, 20),
+            (mavutil.mavlink.MAV_CMD_NAV_ARC_WAYPOINT, 90, 0, 20, {"p1": 90}),
+            (mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH, 0, 0, 0),
+        ])
+
+        self.start_subtest("WP(delay 5s) -> ARC")
+        fly_and_check_arc([
+            (mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 20),
+            (mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 0, 0, 20, {"p1": 5}),
+            (mavutil.mavlink.MAV_CMD_NAV_ARC_WAYPOINT, 90, 0, 20, {"p1": 90}),
+            (mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH, 0, 0, 0),
+        ])
+
+        self.start_subtest("WP -> NAV_DELAY(5s) -> ARC")
+        fly_and_check_arc([
+            (mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 20),
+            (mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 0, 0, 20),
+            (mavutil.mavlink.MAV_CMD_NAV_DELAY, 0, 0, 0, {"p1": 5, "frame": mavutil.mavlink.MAV_FRAME_GLOBAL}),
+            (mavutil.mavlink.MAV_CMD_NAV_ARC_WAYPOINT, 90, 0, 20, {"p1": 90}),
+            (mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH, 0, 0, 0),
+        ])
+
+        self.start_subtest("WP -> CONDITION_DELAY(5s) -> ARC")
+        fly_and_check_arc([
+            (mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 20),
+            (mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 0, 0, 20),
+            (mavutil.mavlink.MAV_CMD_CONDITION_DELAY, 0, 0, 0, {"p1": 5, "frame": mavutil.mavlink.MAV_FRAME_GLOBAL}),
+            (mavutil.mavlink.MAV_CMD_NAV_ARC_WAYPOINT, 90, 0, 20, {"p1": 90}),
+            (mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH, 0, 0, 0),
+        ])
+
     # test circle speed - should be constant degrees/second:
     def CircleSpeed(self):
         '''test the consistent-ground-speed-circling works'''
@@ -4088,6 +4146,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
     UBX_MODEL_M8N_SPG301 = 4
     UBX_MODEL_M9N_SPG404 = 5
     UBX_MODEL_M10_SPG510 = 6
+    UBX_MODEL_X20P_HPG211 = 7
 
     def ublox_sim_config_filepath(self):
         '''the file the simulated u-blox keeps its saved configuration in'''
@@ -4257,6 +4316,132 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             self.disarm_vehicle()
         finally:
             self.ublox_sim_reset_saved_config()
+
+    # offsets in the simulated X20's saved configuration file of its
+    # key values (U4 each, in the order of the simulator's x20_keys
+    # table) and of the bitmask of keys set in the saved layers; they
+    # follow the M10's CFG-VALSET keys
+    UBX_SIM_X20_VALUES_OFFSET = 5 + 14 + 6 + 36 + 8 + 1 + 60 + 10
+    UBX_SIM_X20_SET_OFFSET = UBX_SIM_X20_VALUES_OFFSET + 46*4
+    UBX_SIM_X20_KEY_INDEX = {
+        "CFG-SIGNAL-GPS_ENA": 0,
+        "CFG-SIGNAL-SBAS_ENA": 4,
+        "CFG-SIGNAL-QZSS_ENA": 17,
+    }
+
+    def ublox_sim_x20_saved_value(self, name):
+        '''return a key's value in the simulated X20's saved
+        configuration, or None if it isn't set there'''
+        with open(self.ublox_sim_config_filepath(), "rb") as f:
+            data = f.read()
+        index = self.UBX_SIM_X20_KEY_INDEX[name]
+        (set_mask, ) = struct.unpack("<Q", data[self.UBX_SIM_X20_SET_OFFSET:self.UBX_SIM_X20_SET_OFFSET+8])
+        if not set_mask & (1 << index):
+            return None
+        ofs = self.UBX_SIM_X20_VALUES_OFFSET + 4*index
+        (value, ) = struct.unpack("<I", data[ofs:ofs+4])
+        return value
+
+    def ublox_statustexts(self):
+        '''return the text of the STATUSTEXTs collected, joining texts
+        sent in several chunks'''
+        texts = []
+        first_chunk = {}
+        for m in self.context_collection('STATUSTEXT'):
+            if m.id == 0:
+                texts.append(m.text)
+            elif m.chunk_seq == 0:
+                first_chunk[m.id] = len(texts)
+                texts.append(m.text)
+            elif m.id in first_chunk:
+                texts[first_chunk[m.id]] += m.text
+        return texts
+
+    def ublox_check_gnss_report(self, texts, want):
+        '''check the constellations in the last GNSS report from the
+        u-blox driver in texts are as in want'''
+        reports = [t for t in texts if t.startswith("GPS 1: GNSS: ")]
+        if len(reports) == 0:
+            raise NotAchievedException("No u-blox GNSS report")
+        got = {}
+        for m in re.finditer(r"(\w+)\[(\d)\]", reports[-1]):
+            got[m.group(1)] = int(m.group(2))
+        self.progress("u-blox GNSS: %s" % str(got))
+        for (name, value) in want.items():
+            if got.get(name) != value:
+                raise NotAchievedException("Expected %s[%u] in u-blox GNSS report, got %s" % (name, value, str(got)))
+
+    def ublox_check_configured(self, texts):
+        if "GPS 1: u-blox configured" not in texts:
+            raise NotAchievedException("u-blox not configured")
+
+    def UBloxX20GNSSMode(self):
+        '''check GPS1_GNSS_MODE selects the constellations a u-blox X20 uses'''
+        self.context_push()
+        self.context_collect('STATUSTEXT')
+        GNSS_GPS = 1 << 0
+        GNSS_GAL = 1 << 2
+        GNSS_BDS = 1 << 3
+        GNSS_QZSS = 1 << 5
+        GNSS_GLO = 1 << 6
+        self.set_parameters({
+            "GPS_AUTO_CONFIG": 1,
+            "SIM_GPS1_UBXMDL": self.UBX_MODEL_X20P_HPG211,
+            "GPS1_GNSS_MODE": 0,
+        })
+        factory = {"GPS": 1, "SBAS": 1, "GAL": 1, "BDS": 1, "QZSS": 0, "GLO": 1, "NAVIC": 0}
+
+        self.start_subtest("The factory constellations are reported, GLONASS included")
+        self.ublox_sim_reset_saved_config()
+        self.ublox_sim_boot()
+        texts = self.ublox_statustexts()
+        self.ublox_check_configured(texts)
+        self.ublox_check_gnss_report(texts, factory)
+
+        self.start_subtest("Enable QZSS and disable SBAS")
+        self.set_parameter("GPS1_GNSS_MODE", GNSS_GPS | GNSS_GAL | GNSS_BDS | GNSS_QZSS | GNSS_GLO)
+        self.ublox_sim_boot()
+        texts = self.ublox_statustexts()
+        self.ublox_check_configured(texts)
+        self.ublox_check_gnss_report(texts, {"GPS": 1, "SBAS": 0, "GAL": 1, "BDS": 1, "QZSS": 1, "GLO": 1})
+        if (self.ublox_sim_x20_saved_value("CFG-SIGNAL-QZSS_ENA") != 1 or
+                self.ublox_sim_x20_saved_value("CFG-SIGNAL-SBAS_ENA") != 0):
+            raise NotAchievedException("GNSS configuration not saved")
+
+        self.start_subtest("Constellations the receiver rejects don't stop its configuration")
+        self.ublox_sim_reset_saved_config()
+        # the X20 can't use QZSS without GPS
+        self.set_parameter("GPS1_GNSS_MODE", GNSS_GAL | GNSS_QZSS)
+        self.ublox_sim_boot()
+        texts = self.ublox_statustexts()
+        self.ublox_check_configured(texts)
+        if "GPS 1: u-blox rejected GNSS mode %u" % (GNSS_GAL | GNSS_QZSS) not in texts:
+            raise NotAchievedException("No warning that the GNSS mode was rejected")
+        self.ublox_check_gnss_report(texts, factory)
+        for name in "CFG-SIGNAL-GPS_ENA", "CFG-SIGNAL-QZSS_ENA":
+            if self.ublox_sim_x20_saved_value(name) is not None:
+                raise NotAchievedException("Rejected GNSS configuration saved (%s)" % name)
+        # a mode given up on is tried again once another mode has been set
+        self.context_clear_collection('STATUSTEXT')
+        self.set_parameter("GPS1_GNSS_MODE", 0)
+        self.wait_statustext("GPS 1: u-blox configured", check_context=True, timeout=30)
+        self.set_parameter("GPS1_GNSS_MODE", GNSS_GAL | GNSS_QZSS)
+        self.wait_statustext("GPS 1: updating GNSS mode", check_context=True, timeout=30)
+        self.wait_statustext("GPS 1: u-blox rejected GNSS mode %u" % (GNSS_GAL | GNSS_QZSS), check_context=True, timeout=30)
+
+        self.start_subtest("A change of GPS1_GNSS_MODE is applied without a reboot")
+        self.ublox_sim_reset_saved_config()
+        self.set_parameter("GPS1_GNSS_MODE", 0)
+        self.ublox_sim_boot()
+        self.ublox_check_configured(self.ublox_statustexts())
+        self.context_clear_collection('STATUSTEXT')
+        self.set_parameter("GPS1_GNSS_MODE", GNSS_GPS | GNSS_GAL | GNSS_BDS | GNSS_GLO)
+        self.wait_statustext("GPS 1: u-blox configured", check_context=True, timeout=30)
+        self.ublox_check_gnss_report(self.ublox_statustexts(), {"GPS": 1, "SBAS": 0, "GAL": 1, "BDS": 1, "QZSS": 0, "GLO": 1})
+
+        self.context_pop()
+        self.ublox_sim_reset_saved_config()
+        self.reboot_sitl()
 
     #   SimpleMode - test simple mode flies North regardless of vehicle heading
     def SimpleMode(self):
@@ -13347,6 +13532,71 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         if repeats > steps * 0.1:
             raise NotAchievedException("Post-filter gyro log repeats %u of %u samples" % (repeats, steps))
 
+    def ESCTelemLogRate(self):
+        '''check ESC_TLM_LOG_RATE sets the rate ESC telemetry is logged at, and 0 stops it'''
+        # the harness rate-limits streaming log messages such as ESC; with
+        # no limit the default log buffer can drop the blocks being counted
+        self.set_parameters({
+            "LOG_DARM_RATEMAX": 0,
+            "LOG_FILE_RATEMAX": 0,
+            "LOG_FILE_BUFSIZE": 32767,
+            "SIM_ESC_TELEM": 1,
+        })
+        self.reboot_sitl()
+        # SITL's ESC telemetry starts 6 seconds after boot
+        self.assert_receive_message('ESC_TELEMETRY_1_TO_4', timeout=10)
+        rates_hz = [10, 50, 0]
+        for rate_hz in rates_hz:
+            self.set_parameter("ESC_TLM_LOG_RATE", rate_hz)
+            self.delay_sim_time(10, "log ESC telemetry at %uHz" % rate_hz)
+        # a final change ends the last window
+        self.set_parameter("ESC_TLM_LOG_RATE", 100)
+        log_filepath = self.current_onboard_log_filepath()
+
+        def rate_windows():
+            '''count ESC records per instance between changes of ESC_TLM_LOG_RATE, in log time'''
+            dfreader = self.dfreader_for_path(log_filepath)
+            windows = []
+            while True:
+                m = dfreader.recv_match(type=['PARM', 'ESC'])
+                if m is None:
+                    break
+                if m.get_type() == 'ESC':
+                    if len(windows):
+                        count = windows[-1]["count"]
+                        count[m.Instance] = count.get(m.Instance, 0) + 1
+                    continue
+                if m.Name != 'ESC_TLM_LOG_RATE':
+                    continue
+                if len(windows):
+                    if windows[-1]["rate_hz"] == m.Value:
+                        continue
+                    windows[-1]["end_us"] = m.TimeUS
+                windows.append({"rate_hz": m.Value, "start_us": m.TimeUS, "count": {}})
+            return windows[-len(rates_hz)-1:-1]
+
+        # the log is written in order, so once it holds the final change it
+        # holds every ESC row before it; the larger buffer takes a few seconds
+        tstart = self.get_sim_time()
+        while True:
+            self.delay_sim_time(2, "the file logger writes out the buffer")
+            windows = rate_windows()
+            if [w["rate_hz"] for w in windows] == rates_hz:
+                break
+            if self.get_sim_time_cached() - tstart > 30:
+                raise NotAchievedException("Did not find ESC_TLM_LOG_RATE changes %s in log" % str(rates_hz))
+        self.assert_log_has_no_dropped_blocks(log_filepath)
+        for w in windows:
+            duration_s = (w["end_us"] - w["start_us"]) * 1.0e-6
+            # the default frame is a quad
+            for instance in range(4):
+                achieved_hz = w["count"].get(instance, 0) / duration_s
+                self.progress("ESC_TLM_LOG_RATE=%u: ESC[%u] logged at %.1fHz over %.1fs" %
+                              (w["rate_hz"], instance, achieved_hz, duration_s))
+                if abs(achieved_hz - w["rate_hz"]) > 0.1 * w["rate_hz"]:
+                    raise NotAchievedException("ESC[%u] logged at %.1fHz, want %uHz" %
+                                               (instance, achieved_hz, w["rate_hz"]))
+
     def hover_and_check_matched_frequency(self, *, dblevel=-15, minhz=200, maxhz=300, fftLength=32, peakhz=None):
         '''do a simple up-and-down test flight with current vehicle state.
         Check that the onboard filter comes up with the same peak-frequency that
@@ -14662,7 +14912,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
                 mavutil.mavlink.MAV_SENSOR_ROTATION_NONE: 275,
                 mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_45: 256,
                 mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_90: 1130,
-                mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_135: 1200,
+                mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_135: 680,
                 mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_180: 625,
                 mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_225: 967,
                 mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_270: 760,
@@ -14721,31 +14971,36 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
                 "--home", home_string,
             ])
             self.wait_ready_to_arm()
-            expected_distances_copy = copy.copy(expected_distances)
-            tstart = self.get_sim_time()
-            failed = False
-            wants = []
-            gots = []
+            # some sectors flip between two readings, indefinitely.  The
+            # ld06's YAW_135 reads the nearest post on most samples and
+            # no valid distance on the rest, reported as the ld06's
+            # 1200cm maximum; the sf45b's NONE and YAW_180 sectors flip
+            # too.  Wait for every sector to read its expected distance
+            # at the same moment rather than taking each sector's first
+            # sample, which otherwise latches whichever state that
+            # sector happened to be in - and so moves with anything
+            # which shifts the timing of the boot.
             epsilon = 20
+            latest = {}
+            tstart = self.get_sim_time()
             while True:
-                if self.get_sim_time_cached() - tstart > 30:
-                    raise AutoTestTimeoutException("Failed to get distances")
-                if len(expected_distances_copy.keys()) == 0:
-                    break
                 m = self.assert_receive_message("DISTANCE_SENSOR")
-                if m.orientation not in expected_distances_copy:
-                    continue
-                got = m.current_distance
-                want = expected_distances_copy[m.orientation]
-                wants.append(want)
-                gots.append(got)
-                if abs(want - got) > epsilon:
-                    failed = True
-                del expected_distances_copy[m.orientation]
-            if failed:
-                raise NotAchievedException(
-                    "Distance too great (%s) (want=%s != got=%s)" %
-                    (name, wants, gots))
+                if m.orientation in expected_distances:
+                    latest[m.orientation] = m.current_distance
+                settled = (
+                    len(latest) == len(expected_distances) and
+                    all(abs(expected_distances[o] - latest[o]) <= epsilon
+                        for o in expected_distances)
+                )
+                if settled:
+                    break
+                if self.get_sim_time_cached() - tstart > 30:
+                    orientations = sorted(expected_distances.keys())
+                    raise NotAchievedException(
+                        "Distance too great (%s) (want=%s != got=%s)" %
+                        (name,
+                         [expected_distances[o] for o in orientations],
+                         [latest.get(o) for o in orientations]))
 
     def AC_Avoidance_Proximity_AVOID_ALT_MIN(self):
         '''Test proximity avoidance with AVOID_ALT_MIN'''
@@ -14821,6 +15076,523 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.load_fence("copter-avoidance-fence.txt")
         self.set_parameter("FENCE_ENABLE", 1)
         self.check_avoidance_corners()
+
+    def AC_Avoidance_Dijkstra_OutsideFence(self):
+        '''Test Dijkstra's object avoidance can plan a path home
+        from outside a T-shaped polygon fence.  Check vehicle passes
+        close to one of the fence vertices rather than flying straight home'''
+
+        self.context_set_speedup(8)
+        self.set_parameters({
+            "FENCE_ENABLE": 1,
+            "OA_TYPE": 2,        # Dijkstra's
+            "RC11_OPTION": 11,   # RC aux switch to enable/disable the fence
+        })
+        self.reboot_sitl()
+
+        # T-shaped inclusion fence.  Home sits inside the "stalk"; the "bar"
+        # is to the north.  Vertices are offsets (north, east) from home
+        home_loc = self.home_position_as_location()
+        home_loc_plus_15m = self.offset_location_up(home_loc, 15)
+        stalk_bottom_left = self.offset_location_ne(home_loc_plus_15m, -10, -20)
+        stalk_bottom_right = self.offset_location_ne(home_loc_plus_15m, -10, 20)
+        stalk_top_right = self.offset_location_ne(home_loc_plus_15m, 50, 20)
+        bar_bottom_right = self.offset_location_ne(home_loc_plus_15m, 50, 60)
+        bar_top_right = self.offset_location_ne(home_loc_plus_15m, 80, 60)
+        bar_top_left = self.offset_location_ne(home_loc_plus_15m, 80, -60)
+        bar_bottom_left = self.offset_location_ne(home_loc_plus_15m, 50, -60)
+        stalk_top_left = self.offset_location_ne(home_loc_plus_15m, 50, -20)
+
+        self.upload_fences_from_locations([
+            (mavutil.mavlink.MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION, [
+                stalk_bottom_left,
+                stalk_bottom_right,
+                stalk_top_right,
+                bar_bottom_right,
+                bar_top_right,
+                bar_top_left,
+                bar_bottom_left,
+                stalk_top_left,
+            ]),
+        ])
+
+        # enable fence
+        self.set_rc(11, 2000)
+
+        # takeoff in Loiter and face North
+        self.takeoff(15, mode="LOITER")
+        self.reach_heading_manual(0)
+
+        # roll left and pitch forward, sliding along the fence
+        # until reaching the North-West corner
+        self.set_rc(1, 1400)
+        self.set_rc(2, 1400)
+        self.wait_location(bar_top_left, timeout=100)
+
+        # stop pitching forward; keep rolling left
+        self.set_rc(2, 1500)
+
+        # disable the fence and let the vehicle fly out past the corner to the west
+        self.set_rc(11, 1000)
+        self.wait_distance_to_home(150, 300, timeout=60)
+
+        # centre the roll stick and re-enable the fence; this should trigger
+        # RTL, and Dijkstra must route the vehicle home passing close to
+        # the stalk-top-left point rather than flying straight home
+        self.set_rc(1, 1500)
+        self.set_rc(11, 2000)
+        self.wait_mode("RTL")
+        self.wait_location(stalk_top_left, accuracy=5, timeout=100)
+        self.wait_rtl_complete()
+
+    def upload_T_shaped_fence(self):
+        '''upload a T-shaped inclusion fence around home and return its vertices
+        as Locations 15m above home.  Home sits inside the "stalk", which spans
+        N -10 to 50 by E -20 to 20; the "bar" is to the north and spans
+        N 50 to 80 by E -60 to 60'''
+        home_loc_plus_15m = self.offset_location_up(self.home_position_as_location(), 15)
+        vertices = {
+            "stalk_bottom_left": self.offset_location_ne(home_loc_plus_15m, -10, -20),
+            "stalk_bottom_right": self.offset_location_ne(home_loc_plus_15m, -10, 20),
+            "stalk_top_right": self.offset_location_ne(home_loc_plus_15m, 50, 20),
+            "bar_bottom_right": self.offset_location_ne(home_loc_plus_15m, 50, 60),
+            "bar_top_right": self.offset_location_ne(home_loc_plus_15m, 80, 60),
+            "bar_top_left": self.offset_location_ne(home_loc_plus_15m, 80, -60),
+            "bar_bottom_left": self.offset_location_ne(home_loc_plus_15m, 50, -60),
+            "stalk_top_left": self.offset_location_ne(home_loc_plus_15m, 50, -20),
+        }
+        self.upload_fences_from_locations([
+            (mavutil.mavlink.MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION, list(vertices.values())),
+        ])
+        return vertices
+
+    def AC_Avoidance_Dijkstra_InsideFence(self):
+        '''Test Dijkstra's object avoidance can plan a path home from inside a
+        T-shaped polygon fence whose border blocks line-of-sight to home'''
+
+        self.context_set_speedup(4)
+        self.set_parameters({
+            "FENCE_ENABLE": 1,
+            "OA_TYPE": 2,        # Dijkstra's
+            "RC11_OPTION": 11,   # RC aux switch to enable/disable the fence
+        })
+        self.reboot_sitl()
+
+        vertices = self.upload_T_shaped_fence()
+
+        self.takeoff(15, mode="GUIDED")
+
+        # fly into the western arm of the bar.  Guided only routes position
+        # targets through wpnav (and so through OA) when GUID_OPTIONS bit 6 is
+        # set, so turn the fence off for the trip out and back on once in place.
+        # from there the straight line to home leaves the fence at N=50 where E
+        # is -38.5, well outside the stalk, so the fence blocks line-of-sight home
+        self.set_rc(11, 1000)
+        self.fly_guided_move_local(65, -50, 15)
+        self.set_rc(11, 2000)
+
+        # RTL must round the inside corner at stalk-top-left rather than fly
+        # the blocked straight line, which would pass 14.7m from that vertex
+        self.change_mode("RTL")
+        self.wait_location(vertices["stalk_top_left"], accuracy=8, timeout=100)
+        self.wait_rtl_complete()
+
+    def AC_Avoidance_Dijkstra_FenceEntryPoint(self):
+        '''Test Dijkstra's object avoidance returns the fence entry point to a
+        vehicle outside the fence, even when that entry point can see home
+        directly and the resulting path holds only two points'''
+
+        self.context_set_speedup(4)
+        self.set_parameters({
+            "FENCE_ENABLE": 1,
+            "OA_TYPE": 2,        # Dijkstra's
+            "RC11_OPTION": 11,   # RC aux switch to enable/disable the fence
+        })
+        self.reboot_sitl()
+
+        # rectangular inclusion fence spanning N -20 to 120 by E -70 to 70.
+        # home sits well inside it, so that from a point beyond the western edge
+        # the entry point back into the fence has a clear line to home and the
+        # planned path holds only those two points.  home is deliberately placed
+        # off the bearing from that start point to its entry point, so flying
+        # straight home is clearly distinguishable from being routed via it
+        home_loc_plus_15m = self.offset_location_up(self.home_position_as_location(), 15)
+        self.upload_fences_from_locations([
+            (mavutil.mavlink.MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION, [
+                self.offset_location_ne(home_loc_plus_15m, -20, -70),
+                self.offset_location_ne(home_loc_plus_15m, -20, 70),
+                self.offset_location_ne(home_loc_plus_15m, 120, 70),
+                self.offset_location_ne(home_loc_plus_15m, 120, -70),
+            ]),
+        ])
+
+        # enable fence
+        self.set_rc(11, 2000)
+
+        self.takeoff(15, mode="GUIDED")
+
+        # disable the fence and fly out 40m beyond its western edge
+        self.set_rc(11, 1000)
+        self.fly_guided_move_local(70, -110, 15)
+
+        # the closest fence feature to (70,-110) is the western edge at (70,-70),
+        # so the entry point is the OA margin of 5m inside it
+        entry_point = self.offset_location_ne(home_loc_plus_15m, 70, -65)
+
+        # re-enable the fence; the breach triggers RTL and the vehicle must be
+        # routed via the entry point.  flying straight home instead would pass
+        # 24m from it
+        self.set_rc(11, 2000)
+        self.wait_mode("RTL")
+        self.wait_location(entry_point, accuracy=8, timeout=100)
+        self.wait_rtl_complete()
+
+    def AC_Avoidance_Dijkstra_ExclusionPolygon(self):
+        '''Test Dijkstra's object avoidance routes around an exclusion polygon'''
+
+        self.context_set_speedup(4)
+        self.set_parameters({
+            "FENCE_ENABLE": 1,
+            "OA_TYPE": 2,        # Dijkstra's
+            "RC11_OPTION": 11,   # RC aux switch to enable/disable the fence
+        })
+        self.reboot_sitl()
+
+        home_loc_plus_15m = self.offset_location_up(self.home_position_as_location(), 15)
+
+        # exclusion rectangle lying across the direct line between home and a
+        # point 90m north.  it reaches 10m east of that line and 40m west, so
+        # the shortest way around it is to the east
+        self.upload_fences_from_locations([
+            (mavutil.mavlink.MAV_CMD_NAV_FENCE_POLYGON_VERTEX_EXCLUSION, [
+                self.offset_location_ne(home_loc_plus_15m, 30, -40),
+                self.offset_location_ne(home_loc_plus_15m, 60, -40),
+                self.offset_location_ne(home_loc_plus_15m, 60, 10),
+                self.offset_location_ne(home_loc_plus_15m, 30, 10),
+            ]),
+        ])
+
+        self.takeoff(15, mode="GUIDED")
+
+        # fly to the far side of the exclusion polygon.  Guided only routes
+        # position targets through wpnav (and so through OA) when GUID_OPTIONS
+        # bit 6 is set, so turn the fence off for the trip out and back on once
+        # in place
+        self.set_rc(11, 1000)
+        self.fly_guided_move_local(90, 0, 15)
+        self.set_rc(11, 2000)
+
+        # RTL must route around the exclusion polygon.  the eastern leg runs
+        # down E=13.5, the polygon expanded by the 5m OA margin, and flying
+        # straight down the middle would pass 13.5m from its midpoint
+        self.change_mode("RTL")
+        detour_midpoint = self.offset_location_ne(home_loc_plus_15m, 45, 13.5)
+        self.wait_location(detour_midpoint, accuracy=8, timeout=120)
+        self.wait_rtl_complete()
+
+    def AC_Avoidance_Dijkstra_ExclusionBesideEdge(self):
+        '''Test Dijkstra's object avoidance finds the fence entry point for a
+        vehicle outside the fence when an exclusion polygon sits just inside
+        the fence edge nearest the vehicle'''
+
+        self.context_set_speedup(4)
+        self.set_parameters({
+            "FENCE_ENABLE": 1,
+            "OA_TYPE": 2,        # Dijkstra's
+            "RC11_OPTION": 11,   # RC aux switch to enable/disable the fence
+        })
+        self.reboot_sitl()
+
+        # rectangular inclusion fence spanning N -20 to 120 by E -70 to 70, with
+        # an exclusion rectangle spanning N 60 to 90 by E -68 to -50, 2m inside
+        # its western edge
+        home_loc_plus_15m = self.offset_location_up(self.home_position_as_location(), 15)
+        self.upload_fences_from_locations([
+            (mavutil.mavlink.MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION, [
+                self.offset_location_ne(home_loc_plus_15m, -20, -70),
+                self.offset_location_ne(home_loc_plus_15m, -20, 70),
+                self.offset_location_ne(home_loc_plus_15m, 120, 70),
+                self.offset_location_ne(home_loc_plus_15m, 120, -70),
+            ]),
+            (mavutil.mavlink.MAV_CMD_NAV_FENCE_POLYGON_VERTEX_EXCLUSION, [
+                self.offset_location_ne(home_loc_plus_15m, 60, -68),
+                self.offset_location_ne(home_loc_plus_15m, 90, -68),
+                self.offset_location_ne(home_loc_plus_15m, 90, -50),
+                self.offset_location_ne(home_loc_plus_15m, 60, -50),
+            ]),
+        ])
+
+        # enable fence
+        self.set_rc(11, 2000)
+
+        self.takeoff(15, mode="GUIDED")
+
+        # disable the fence and fly out 40m beyond its western edge, level with
+        # the exclusion polygon
+        self.set_rc(11, 1000)
+        self.fly_guided_move_local(70, -110, 15)
+
+        # the point 5m inside the western edge at (70,-65) is inside the
+        # exclusion polygon, so the entry point is where the western edge and
+        # the exclusion polygon's southern edge, each moved 5m into the fence,
+        # cross.  flying straight home instead would pass 14m from it
+        entry_point = self.offset_location_ne(home_loc_plus_15m, 55, -65)
+
+        # re-enable the fence; the breach triggers RTL and the vehicle must be
+        # routed via the entry point
+        self.set_rc(11, 2000)
+        self.wait_mode("RTL")
+        self.wait_location(entry_point, accuracy=8, timeout=100)
+        self.wait_rtl_complete()
+
+    def assert_dijkstra_holds_outside(self, inside, duration=20):
+        '''check for duration seconds that the vehicle's (north, east) offset
+        from home never satisfies inside(north, east)'''
+        tstart = self.get_sim_time()
+        while self.get_sim_time_cached() - tstart < duration:
+            pos = self.assert_receive_message('LOCAL_POSITION_NED')
+            if inside(pos.x, pos.y):
+                raise NotAchievedException("Vehicle entered the exclusion zone at N=%.1f E=%.1f" % (pos.x, pos.y))
+
+    def AC_Avoidance_Dijkstra_EntryLegExclusion(self):
+        '''Test Dijkstra's object avoidance refuses to plan a path for a vehicle
+        outside the fence when the leg to the fence entry point crosses an
+        exclusion polygon'''
+
+        self.context_set_speedup(4)
+        self.set_parameters({
+            "FENCE_ENABLE": 1,
+            "OA_TYPE": 2,        # Dijkstra's
+            "RC11_OPTION": 11,   # RC aux switch to enable/disable the fence
+        })
+        self.reboot_sitl()
+
+        # rectangular inclusion fence spanning N -20 to 120 by E -70 to 70, with
+        # an exclusion rectangle outside its western edge spanning N 65 to 80 by
+        # E -100 to -85.  the straight line home from (70,-110) passes south of it
+        home_loc_plus_15m = self.offset_location_up(self.home_position_as_location(), 15)
+        self.upload_fences_from_locations([
+            (mavutil.mavlink.MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION, [
+                self.offset_location_ne(home_loc_plus_15m, -20, -70),
+                self.offset_location_ne(home_loc_plus_15m, -20, 70),
+                self.offset_location_ne(home_loc_plus_15m, 120, 70),
+                self.offset_location_ne(home_loc_plus_15m, 120, -70),
+            ]),
+            (mavutil.mavlink.MAV_CMD_NAV_FENCE_POLYGON_VERTEX_EXCLUSION, [
+                self.offset_location_ne(home_loc_plus_15m, 65, -100),
+                self.offset_location_ne(home_loc_plus_15m, 80, -100),
+                self.offset_location_ne(home_loc_plus_15m, 80, -85),
+                self.offset_location_ne(home_loc_plus_15m, 65, -85),
+            ]),
+        ])
+
+        # enable fence
+        self.set_rc(11, 2000)
+
+        self.takeoff(15, mode="GUIDED")
+
+        # disable the fence and fly out 40m beyond its western edge
+        self.set_rc(11, 1000)
+        self.fly_guided_move_local(70, -110, 15)
+
+        # re-enable the fence; the breach triggers RTL.  the leg to the entry
+        # point at (70,-65) crosses the exclusion polygon, so no path is planned
+        # and the vehicle holds outside it
+        self.set_rc(11, 2000)
+        self.wait_mode("RTL")
+        self.wait_statustext("Dijkstra: could not find path", check_context=False, timeout=30)
+        self.assert_dijkstra_holds_outside(lambda n, e: 65 <= n <= 80 and -100 <= e <= -85)
+
+        # disable the fence so the vehicle can fly straight home
+        self.set_rc(11, 1000)
+        self.wait_rtl_complete()
+
+    def AC_Avoidance_Dijkstra_EntryLegFromExclusion(self):
+        '''Test Dijkstra's object avoidance for a vehicle inside a U-shaped
+        exclusion polygon outside the fence: no path is planned when the leg to
+        the fence entry point leaves one arm and crosses the other, and a path is
+        planned when the leg only leaves the polygon'''
+
+        self.context_set_speedup(4)
+        self.set_parameters({
+            "FENCE_ENABLE": 1,
+            "OA_TYPE": 2,        # Dijkstra's
+            "RC11_OPTION": 11,   # RC aux switch to enable/disable the fence
+        })
+        self.reboot_sitl()
+
+        # rectangular inclusion fence spanning N -20 to 120 by E -70 to 70, with
+        # a U-shaped exclusion polygon outside its western edge, open to the
+        # north: west arm E -115 to -105, east arm E -95 to -85, base N 50 to 60
+        home_loc_plus_15m = self.offset_location_up(self.home_position_as_location(), 15)
+        self.upload_fences_from_locations([
+            (mavutil.mavlink.MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION, [
+                self.offset_location_ne(home_loc_plus_15m, -20, -70),
+                self.offset_location_ne(home_loc_plus_15m, -20, 70),
+                self.offset_location_ne(home_loc_plus_15m, 120, 70),
+                self.offset_location_ne(home_loc_plus_15m, 120, -70),
+            ]),
+            (mavutil.mavlink.MAV_CMD_NAV_FENCE_POLYGON_VERTEX_EXCLUSION, [
+                self.offset_location_ne(home_loc_plus_15m, n, e) for (n, e) in [
+                    (50, -115), (85, -115), (85, -105), (60, -105),
+                    (60, -95), (85, -95), (85, -85), (50, -85),
+                ]]),
+        ])
+
+        # enable fence
+        self.set_rc(11, 2000)
+
+        self.takeoff(15, mode="GUIDED")
+
+        # disable the fence and fly into the west arm of the exclusion polygon
+        self.set_rc(11, 1000)
+        self.fly_guided_move_local(70, -110, 15)
+
+        # re-enable the fence; the breach triggers RTL.  the leg to the entry
+        # point at (70,-65) leaves the west arm and crosses the east arm, so no
+        # path is planned and the vehicle holds outside the east arm
+        self.set_rc(11, 2000)
+        self.wait_mode("RTL")
+        self.wait_statustext("Dijkstra: could not find path", check_context=False, timeout=30)
+        self.assert_dijkstra_holds_outside(lambda n, e: 60 <= n <= 85 and -95 <= e <= -85)
+
+        # disable the fence before leaving RTL, then fly into the east arm
+        self.set_rc(11, 1000)
+        self.change_mode("GUIDED")
+        self.fly_guided_move_local(70, -90, 15)
+
+        # re-enable the fence; the breach triggers RTL.  the leg to the entry
+        # point at (70,-65) only leaves the east arm, so the path is planned
+        self.set_rc(11, 2000)
+        self.wait_mode("RTL")
+        self.wait_dijkstra_route([(70, -65)])
+
+    def AC_Avoidance_Dijkstra_DestinationInExclusion(self):
+        '''Test Dijkstra's object avoidance refuses to plan a path to a
+        destination inside an exclusion polygon'''
+
+        self.context_set_speedup(4)
+        self.set_parameters({
+            "FENCE_ENABLE": 1,
+            "OA_TYPE": 2,        # Dijkstra's
+            "RC11_OPTION": 11,   # RC aux switch to enable/disable the fence
+        })
+        self.reboot_sitl()
+
+        # rectangular inclusion fence spanning N -20 to 120 by E -70 to 70, with
+        # an exclusion square around home spanning N -10 to 10 by E -10 to 10
+        home_loc_plus_15m = self.offset_location_up(self.home_position_as_location(), 15)
+        self.upload_fences_from_locations([
+            (mavutil.mavlink.MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION, [
+                self.offset_location_ne(home_loc_plus_15m, -20, -70),
+                self.offset_location_ne(home_loc_plus_15m, -20, 70),
+                self.offset_location_ne(home_loc_plus_15m, 120, 70),
+                self.offset_location_ne(home_loc_plus_15m, 120, -70),
+            ]),
+            (mavutil.mavlink.MAV_CMD_NAV_FENCE_POLYGON_VERTEX_EXCLUSION, [
+                self.offset_location_ne(home_loc_plus_15m, -10, -10),
+                self.offset_location_ne(home_loc_plus_15m, 10, -10),
+                self.offset_location_ne(home_loc_plus_15m, 10, 10),
+                self.offset_location_ne(home_loc_plus_15m, -10, 10),
+            ]),
+        ])
+
+        # home is inside the exclusion polygon, so the fence must be disabled to
+        # arm and to fly out of it
+        self.set_rc(11, 2000)
+        self.set_rc(11, 1000)
+        self.takeoff(15, mode="GUIDED")
+        self.fly_guided_move_local(60, 0, 15)
+        self.set_rc(11, 2000)
+
+        # RTL to home inside the exclusion polygon is refused, so the vehicle
+        # holds outside it
+        self.change_mode("RTL")
+        self.wait_statustext("Dijkstra: could not find path", check_context=False, timeout=30)
+        self.assert_dijkstra_holds_outside(lambda n, e: -10 <= n <= 10 and -10 <= e <= 10)
+
+        # disable the fence so the vehicle can fly home
+        self.set_rc(11, 1000)
+        self.wait_rtl_complete()
+
+    def upload_T_shaped_fence_home_outside(self):
+        '''upload a T-shaped inclusion fence placed north of home so that home
+        lies outside it.  The "stalk" spans N 40 to 85 by E -30 to 10; the "bar"
+        is to the north and spans N 85 to 115 by E -75 to 45'''
+        home_loc_plus_15m = self.offset_location_up(self.home_position_as_location(), 15)
+        self.upload_fences_from_locations([
+            (mavutil.mavlink.MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION, [
+                self.offset_location_ne(home_loc_plus_15m, n, e) for (n, e) in [
+                    (85, -75), (115, -75), (115, 45), (85, 45),
+                    (85, 10), (40, 10), (40, -30), (85, -30),
+                ]]),
+        ])
+
+    def dijkstra_rtl_home_outside_fence(self, start_n, start_e):
+        '''fly to (start_n, start_e) with the fence disabled, then enable it so
+        the breach triggers RTL to a home that is also outside the fence'''
+        self.context_set_speedup(4)
+        self.set_parameters({
+            "FENCE_ENABLE": 1,
+            "OA_TYPE": 2,        # Dijkstra's
+            "RC11_OPTION": 11,   # RC aux switch to enable/disable the fence
+        })
+        self.reboot_sitl()
+        self.upload_T_shaped_fence_home_outside()
+
+        # home is outside the fence, so it must be disabled to arm
+        self.set_rc(11, 2000)
+        self.set_rc(11, 1000)
+        self.takeoff(15, mode="GUIDED")
+        self.fly_guided_move_local(start_n, start_e, 15)
+
+        # re-enable the fence; the breach triggers RTL
+        self.set_rc(11, 2000)
+        self.wait_mode("RTL")
+
+    def wait_dijkstra_route(self, route):
+        '''wait for the vehicle to pass within 8m of each (north, east) offset
+        from home in route, in order, then for RTL to complete'''
+        home_loc_plus_15m = self.offset_location_up(self.home_position_as_location(), 15)
+        for (n, e) in route:
+            self.wait_location(self.offset_location_ne(home_loc_plus_15m, n, e), accuracy=8, timeout=100)
+        self.wait_rtl_complete()
+
+    def AC_Avoidance_Dijkstra_HomeOutside_EntryNearest(self):
+        '''Test Dijkstra's object avoidance RTL with home and the vehicle both
+        outside the fence, where the fence entry point is closer to the vehicle
+        than any Dijkstra point'''
+        # the straight line home from (70,-40) crosses the stalk.  the entry
+        # point 5m inside the stalk's west edge is 15m away while the nearest
+        # Dijkstra point, inside the stalk-top-left corner, is 23m away.  the
+        # vehicle leaves the fence at the exit point 5m inside the stalk's
+        # southern edge, on the way to home
+        self.dijkstra_rtl_home_outside_fence(70, -40)
+        self.wait_dijkstra_route([(70, -25), (45, 0)])
+
+    def AC_Avoidance_Dijkstra_HomeOutside_ViaInnerCorner(self):
+        '''Test Dijkstra's object avoidance RTL with home and the vehicle both
+        outside the fence, where the path runs via the stalk-top-left inner corner'''
+        # the vehicle enters at the bar's inset north-west corner.  the line
+        # from there to the exit point leaves the fence across the bottom of the
+        # bar's western arm, so the path turns at the Dijkstra point inside the
+        # stalk-top-left corner
+        self.dijkstra_rtl_home_outside_fence(110, -85)
+        self.wait_dijkstra_route([(110, -70), (88.5, -26.5), (45, 0)])
+
+    def AC_Avoidance_Dijkstra_HomeOutside_NorthWestCorner(self):
+        '''Test Dijkstra's object avoidance RTL with home and the vehicle both
+        outside the fence, where the vehicle starts just north of the bar's
+        north-west corner'''
+        self.dijkstra_rtl_home_outside_fence(120, -75)
+        self.wait_dijkstra_route([(110, -70), (88.5, -26.5), (45, 0)])
+
+    def AC_Avoidance_Dijkstra_HomeOutside_ThroughFence(self):
+        '''Test Dijkstra's object avoidance RTL with home and the vehicle both
+        outside the fence, where the vehicle starts directly north of the T so
+        the straight line home passes through the bar and down the stalk'''
+        self.dijkstra_rtl_home_outside_fence(125, 0)
+        self.wait_dijkstra_route([(110, 0), (45, 0)])
 
     def AvoidanceAltFence(self):
         '''Test fence avoidance at minimum and maximum altitude'''
@@ -18232,6 +19004,87 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.assert_prearm_failure("EK3 sources require Compass")
         self.context_pop()
 
+    def HeightKeptOnAidingLossWithAltOffset(self):
+        '''losing aiding must not step the height by the baro offset'''
+        # the EKF only learns an offset between baro and its height estimate
+        # while baro is not the height source.  Learn one from GPS height
+        # (source set 1) then switch to baro height (source set 2).
+        self.set_parameters({
+            "EK3_SRC1_POSXY": 3,  # GPS
+            "EK3_SRC1_VELXY": 3,  # GPS
+            "EK3_SRC1_POSZ": 3,   # GPS
+            "EK3_SRC1_VELZ": 3,   # GPS
+            "EK3_SRC2_POSXY": 3,  # GPS
+            "EK3_SRC2_VELXY": 3,  # GPS
+            "EK3_SRC2_POSZ": 1,   # Baro
+            "EK3_SRC2_VELZ": 0,   # None
+        })
+        self.takeoff(12, mode='ALT_HOLD')
+
+        self.progress("Make baro disagree with GPS height so an offset is learned")
+        self.set_parameter("SIM_BARO_GLITCH", 5)
+        self.delay_sim_time(15, "let the baro offset be learned")
+
+        self.progress("Switch to baro height and stop GPS")
+        self.run_cmd(mavutil.mavlink.MAV_CMD_SET_EKF_SOURCE_SET, 2)
+        self.delay_sim_time(10, "settle on baro height")
+        self.context_collect('STATUSTEXT')
+        self.set_parameter("SIM_GPS1_ENABLE", 0)
+        # the EKF reports height relative to its origin, which includes the
+        # baro offset; compare against that rather than truth
+        alt_before = self.assert_receive_message('GLOBAL_POSITION_INT').relative_alt * 0.001
+        self.wait_statustext("EKF3 IMU0 stopped aiding", check_context=True, timeout=60)
+
+        max_step = 0
+        tstart = self.get_sim_time()
+        while self.get_sim_time() - tstart < 6:
+            alt = self.assert_receive_message('GLOBAL_POSITION_INT').relative_alt * 0.001
+            max_step = max(max_step, abs(alt - alt_before))
+        self.progress("Height changed by up to %.2f m after aiding stopped" % max_step)
+        if max_step > 1:
+            raise NotAchievedException("height stepped %.2f m when aiding stopped" % max_step)
+
+        self.set_parameter("SIM_GPS1_ENABLE", 1)
+        self.do_RTL()
+
+    def HeightKeptOnAidingLossWithOgnHgtMask(self):
+        '''losing aiding must not step the height by the EKF origin height correction'''
+        # with EK3_OGN_HGT_MASK bits 0 and 2 set, the EKF learns the baro drift
+        # relative to GPS and applies it to the baro height measurement.  The
+        # AID_NONE entry has to include that correction as well.
+        self.set_parameters({
+            "EK3_SRC1_POSXY": 3,  # GPS
+            "EK3_SRC1_VELXY": 3,  # GPS
+            "EK3_SRC1_POSZ": 1,   # Baro
+            "EK3_OGN_HGT_MASK": 5,  # correct when using baro, apply to local position
+        })
+        self.reboot_sitl()
+        self.wait_ready_to_arm()
+        self.takeoff(12, mode='ALT_HOLD')
+
+        self.progress("Drift the baro so a correction is learned against GPS height")
+        self.set_parameter("SIM_BARO_DRIFT", 0.2)
+        self.delay_sim_time(40, "drift the baro")
+        self.set_parameter("SIM_BARO_DRIFT", 0)
+        self.delay_sim_time(30, "let the origin height correction settle")
+
+        self.context_collect('STATUSTEXT')
+        alt_before = self.assert_receive_message('GLOBAL_POSITION_INT').relative_alt * 0.001
+        self.set_parameter("SIM_GPS1_ENABLE", 0)
+        self.wait_statustext("EKF3 IMU0 stopped aiding", check_context=True, timeout=60)
+
+        max_step = 0
+        tstart = self.get_sim_time()
+        while self.get_sim_time() - tstart < 6:
+            alt = self.assert_receive_message('GLOBAL_POSITION_INT').relative_alt * 0.001
+            max_step = max(max_step, abs(alt - alt_before))
+        self.progress("Height changed by up to %.2f m after aiding stopped" % max_step)
+        if max_step > 1:
+            raise NotAchievedException("height stepped %.2f m when aiding stopped" % max_step)
+
+        self.set_parameter("SIM_GPS1_ENABLE", 1)
+        self.do_RTL()
+
     def EK3_EXT_NAV_vel_without_vert(self):
         '''Test that EK3 External Navigation velocity works without vertical velocity.'''
 
@@ -21618,9 +22471,22 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         ret.extend([
             self.SetModesViaModeSwitch,
             self.WPArcs2,
+            self.WPArcDelay,
             self.BatteryFailsafeBrakeLandNoGPS,
             self.AC_Avoidance_Proximity,
             self.AC_Avoidance_Fence,
+            self.AC_Avoidance_Dijkstra_OutsideFence,
+            self.AC_Avoidance_Dijkstra_InsideFence,
+            self.AC_Avoidance_Dijkstra_FenceEntryPoint,
+            self.AC_Avoidance_Dijkstra_ExclusionPolygon,
+            self.AC_Avoidance_Dijkstra_HomeOutside_EntryNearest,
+            self.AC_Avoidance_Dijkstra_HomeOutside_ViaInnerCorner,
+            self.AC_Avoidance_Dijkstra_HomeOutside_NorthWestCorner,
+            self.AC_Avoidance_Dijkstra_HomeOutside_ThroughFence,
+            self.AC_Avoidance_Dijkstra_ExclusionBesideEdge,
+            self.AC_Avoidance_Dijkstra_EntryLegExclusion,
+            self.AC_Avoidance_Dijkstra_EntryLegFromExclusion,
+            self.AC_Avoidance_Dijkstra_DestinationInExclusion,
             self.SetpointGlobalVel,
             self.SetpointBadVel,
             self.ModeLoiter,
@@ -21642,6 +22508,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             self.FenceRelativeToHomeCliff,
             self.DynamicRpmNotches, # Do not add attempts to this - failure is sign of a bug
             self.DynamicRpmNotchesRateThread,
+            self.ESCTelemLogRate,
             self.RateThreadPostFilterGyroLog,
             self.DynamicRpmNotchesESCMask,
             self.WPYawBehaviour1RTL,
@@ -21889,6 +22756,8 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             self.FenceRelativeToAMSLMaxAlt,
             self.MotorTest,
             self.EKFSource,
+            self.HeightKeptOnAidingLossWithAltOffset,
+            self.HeightKeptOnAidingLossWithOgnHgtMask,
             self.AHRSSwitchBackendPositionReset,
             self.EK3YawAlignEachTakeoff,
             self.EKFYawResetLogged,
@@ -23937,6 +24806,34 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
                 ek2_origin.longitude != ek3_origin.longitude or
                 ek2_origin.altitude != ek3_origin.altitude):
             raise NotAchievedException("Did not get matching EK2 and EK3 origins")
+
+    def EKF2YawAt90Degrees(self):
+        """EKF2 must still fuse yaw, and so take up GPS, facing exactly west"""
+        if self.sitl_start_heading() not in (90, 270):
+            raise ValueError("start heading must be 90 or 270 for this test")
+        self.set_parameters({
+            'EK2_ENABLE': 1,
+            'AHRS_EKF_TYPE': 2,
+        })
+        self.reboot_sitl()
+        self.wait_ready_to_arm()
+        # with the declination already known when EKF2 aligns its
+        # yaw, the yaw is exactly the start heading (SITL's compass
+        # has no noise).  Before the fix, EKF2 fused no yaw within
+        # 0.06 degrees of +-90 degrees, so never learned its yaw gyro
+        # bias, and never started using GPS
+        declination = self.get_parameter('COMPASS_DEC')
+        # the automatic declination is set but not saved, so it must
+        # be changed for setting it to be sent and saved
+        self.set_parameters({
+            'COMPASS_AUTODEC': 0,
+            'COMPASS_DEC': 0,
+        })
+        self.set_parameter('COMPASS_DEC', declination)
+        self.context_collect('STATUSTEXT')
+        self.reboot_sitl()
+        self.wait_statustext("EKF2 IMU0 is using GPS", timeout=60, check_context=True)
+        self.wait_statustext("EKF2 IMU1 is using GPS", timeout=60, check_context=True)
 
     def CommonOriginExternalAHRS(self):
         '''ensure an ExternalAHRS origin is shared into EKF2 and EKF3'''
@@ -26434,6 +27331,7 @@ return update, 1000
             self.UBloxNoSaveEveryBoot,
             self.UBloxNavSolInSavedConfig,
             self.UBloxConfigWhileArmed,
+            self.UBloxX20GNSSMode,
             self.AirModeLanding,
             self.TestLocalHomePosition,
             self.TestGripperMission,
@@ -26464,6 +27362,7 @@ return update, 1000
             self.GuidedWeatherVane,
             self.LoggingFormat,
             self.CommonOrigin,
+            self.EKF2YawAt90Degrees,
             self.RC_OPTIONS_1_FS_THR_ENABLE_0,
             self.CompassLearnCopyFromEKFAffinity,
             self.CompassLearnDisabledDoesNotSave,

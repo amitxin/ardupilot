@@ -248,32 +248,99 @@ def to_unsigned(i):
         i += 2**32
     return i
 
-def sign_firmware(image, private_keyfile):
+def sign_firmware(img1, img2, extf_img, private_keyfile):
     '''sign firmware with private key'''
     try:
         import monocypher
     except ImportError:
         Logs.error("Please install monocypher with: python3 -m pip install pymonocypher==3.1.3.2")
-        return None
+        return None, None
 
     if monocypher.__version__ != "3.1.3.2":
         Logs.error("must use monocypher 3.1.3.2, please run: python3 -m pip install pymonocypher==3.1.3.2")
-        return None
+        return None, None
 
     try:
         key = open(private_keyfile, 'r').read()
     except Exception as ex:
         Logs.error("Failed to open %s" % private_keyfile)
-        return None
+        return None, None
     keytype = "PRIVATE_KEYV1:"
     if not key.startswith(keytype):
         Logs.error("Bad private key file %s" % private_keyfile)
-        return None
+        return None, None
     key = base64.b64decode(key[len(keytype):])
-    sig = monocypher.signature_sign(key, image)
+    sig = monocypher.signature_sign(key, img1 + img2)
     sig_len = len(sig)
-    sig_version = 30437
-    return struct.pack("<IQ64s", sig_len+8, sig_version, sig)
+    sig_version_internal_only = 30437
+    signed_descriptor = struct.pack("<IQ64s", sig_len+8, sig_version_internal_only, sig)
+    extf_signature = None
+    if extf_img:
+        signature_domain = b'ArduPilotFwSig2'
+        image_lengths = struct.pack('<III', len(img1), len(img2), len(extf_img))
+        image = signature_domain + image_lengths + img1 + img2 + extf_img
+        extf_sig = monocypher.signature_sign(key, image)
+        extf_signature = struct.pack("<IQ64s", len(extf_sig)+8, 30438, extf_sig)
+    return signed_descriptor, extf_signature
+
+
+def add_elf_load_segment(elf_path, address, size):
+    '''make an ELF section at address available to segment-based loaders'''
+    elf = bytearray(open(elf_path, 'rb').read())
+    if len(elf) < 52 or elf[:6] != b'\x7fELF\x01\x01':
+        raise Errors.WafError("expected a 32-bit little-endian ELF")
+
+    phoff, shoff = struct.unpack_from('<II', elf, 28)
+    phentsize, phnum = struct.unpack_from('<HH', elf, 42)
+    shentsize, shnum = struct.unpack_from('<HH', elf, 46)
+    if phentsize != 32 or shentsize != 40:
+        raise Errors.WafError("unexpected ELF header sizes")
+    if (phoff + phentsize * phnum > len(elf) or
+            shoff + shentsize * shnum > len(elf)):
+        raise Errors.WafError("ELF headers extend past end of file")
+
+    section_offset = None
+    section_header_offset = None
+    first_section_offset = len(elf)
+    for index in range(shnum):
+        header_offset = shoff + index * shentsize
+        section = struct.unpack_from('<IIIIIIIIII', elf, header_offset)
+        section_type, section_address = section[1], section[3]
+        file_offset, section_size = section[4], section[5]
+        if section_type != 8 and section_size != 0:
+            first_section_offset = min(first_section_offset, file_offset)
+        if section_type == 1 and section_address == address and section_size == size:
+            if section_offset is not None:
+                raise Errors.WafError("multiple matching ELF signature sections")
+            section_offset = file_offset
+            section_header_offset = header_offset
+    if section_offset is None:
+        raise Errors.WafError("ELF signature section not found")
+
+    # SHF_ALLOC makes section-based loaders such as GDB include the trailer.
+    section_flags = struct.unpack_from('<I', elf, section_header_offset + 8)[0]
+    struct.pack_into('<I', elf, section_header_offset + 8, section_flags | 2)
+
+    # Segment-based loaders such as OpenOCD only consider PT_LOAD entries.
+    new_header_offset = phoff + phentsize * phnum
+    if new_header_offset + phentsize > first_section_offset:
+        raise Errors.WafError("no room for ELF signature program header")
+    struct.pack_into(
+        '<IIIIIIII', elf, new_header_offset,
+        1, section_offset, address, address, size, size, 4, 1)
+    struct.pack_into('<H', elf, 44, phnum + 1)
+    open(elf_path, 'wb').write(elf)
+
+
+def find_app_descriptor(img, descriptor):
+    """Find the single zero-initialized application descriptor."""
+    marker = descriptor + bytes(16)
+    offset = img.find(marker)
+    if offset == -1:
+        return -1
+    if img.find(marker, offset + 1) != -1:
+        raise Errors.WafError("multiple zero-initialized APP_DESCRIPTOR markers")
+    return offset
 
 
 class set_app_descriptor(Task.Task):
@@ -289,11 +356,16 @@ class set_app_descriptor(Task.Task):
         else:
             descriptor = b'\x40\xa2\xe4\xf1\x64\x68\x91\x06'
 
-        elf_in, bin_in = self.inputs
+        elf_in, bin_in = self.inputs[:2]
+        extf_img = bytearray()
+        if len(self.inputs) > 2:
+            extf_img = bytearray(open(self.inputs[2].abspath(), 'rb').read())
         elf_out, bin_out = self.outputs
 
         img = bytearray(open(bin_in.abspath(), 'rb').read())
-        offset = img.find(descriptor)
+        extf_signature = None
+        image_size = 0
+        offset = find_app_descriptor(img, descriptor)
         if offset == -1:
             Logs.info("No APP_DESCRIPTOR found")
         else:
@@ -310,6 +382,11 @@ class set_app_descriptor(Task.Task):
                 desc_len = 92
             else:
                 desc_len = 16
+            # version, version_minor and board_id occupy four bytes after
+            # the descriptor body. The external image size follows them and
+            # is covered by both the internal CRC and firmware signature.
+            extf_size_offset = offset + desc_len + 4
+            struct.pack_into('<I', img, extf_size_offset, len(extf_img))
             img1 = bytearray(img[:offset])
             img2 = bytearray(img[offset+desc_len:])
             crc1 = to_unsigned(crc32(img1))
@@ -318,30 +395,56 @@ class set_app_descriptor(Task.Task):
             if self.generator.bld.env.AP_SIGNED_FIRMWARE:
                 sig = bytearray([0 for i in range(76)])
                 if self.generator.bld.env.PRIVATE_KEY:
-                    sig_signed = sign_firmware(img1+img2, self.generator.bld.env.PRIVATE_KEY)
+                    sig_signed, extf_signature = sign_firmware(img1, img2, extf_img, self.generator.bld.env.PRIVATE_KEY)
                     if sig_signed:
                         Logs.info("Signed firmware")
                         sig = sig_signed
                     else:
                         self.generator.bld.fatal("Signing failed")
-                desc = struct.pack('<IIII76s', crc1, crc2, len(img), githash, sig)
+                image_size = len(img)
+                desc = struct.pack('<IIII76s', crc1, crc2, image_size, githash, sig)
             else:
                 desc = struct.pack('<IIII', crc1, crc2, len(img), githash)
             img[offset:offset+desc_len] = desc
+            if self.generator.bld.env.AP_SIGNED_FIRMWARE and extf_signature:
+                img += extf_signature
             Logs.info("Applying APP_DESCRIPTOR %08x%08x" % (crc1, crc2))
         open(bin_out.abspath(), 'wb').write(img)
 
         elf_img = bytearray(open(elf_in.abspath(), 'rb').read())
         if offset != -1:
-            zero_descriptor = descriptor + struct.pack("<IIII",0,0,0,0)
-            elf_ofs = elf_img.find(zero_descriptor)
+            elf_ofs = find_app_descriptor(elf_img, descriptor)
             if elf_ofs == -1:
                 Logs.info("No APP_DESCRIPTOR found in elf file")
             else:
                 elf_ofs += len(descriptor)
                 elf_img[elf_ofs:elf_ofs+desc_len] = desc
+                struct.pack_into('<I', elf_img, elf_ofs+desc_len+4, len(extf_img))
                 Logs.info("Applying APP_DESCRIPTOR %08x%08x to elf" % (crc1, crc2))
         open(elf_out.abspath(), 'wb').write(elf_img)
+        if extf_signature:
+            # Keep direct ELF loading equivalent to loading the BIN: the
+            # bootloader reads this trailer immediately after the image.
+            signature_path = elf_out.abspath() + '.extf_signature'
+            open(signature_path, 'wb').write(extf_signature)
+            try:
+                signature_address = 0x08000000 + int(self.env.FLASH_RESERVE_START_KB) * 1024 + image_size
+                command = [
+                    self.env.get_flat('OBJCOPY'),
+                    '--add-section', '.extf_signature=' + signature_path,
+                    '--set-section-flags',
+                    '.extf_signature=readonly,data,contents',
+                    '--change-section-address',
+                    '.extf_signature=0x%08x' % signature_address,
+                    elf_out.abspath(), elf_out.abspath(),
+                ]
+                ret = self.exec_command(command)
+                if ret != 0:
+                    return ret
+                add_elf_load_segment(
+                    elf_out.abspath(), signature_address, len(extf_signature))
+            finally:
+                os.unlink(signature_path)
 
 
 class generate_apj(Task.Task):
@@ -475,7 +578,7 @@ def chibios_firmware(self):
     if do_patch:
         self.env.APP_DESCRIPTOR_GITHASH = os.environ.get('GIT_VERSION', self.env.GIT_HEAD_HASH)
         app_descriptor_task = self.create_task('set_app_descriptor',
-                                                src=[elf, raw_bin],
+                                                src=[elf, raw_bin] + extf_bin,
                                                 tgt=[link_output, intf_bin])
         # the step imports crc32 from uploader.py, so an edit to it patches again
         app_descriptor_task.dep_nodes.append(self.bld.srcnode.find_node('Tools/scripts/uploader.py'))
